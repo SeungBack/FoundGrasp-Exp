@@ -1,0 +1,41 @@
+# Smoke test: verifies all three loops (training / validation / final-test) run
+# without errors in ~10-20 minutes.
+#
+# Run:
+#   CUDA_VISIBLE_DEVICES=0 python train.py --config configs/debug/smoke.yaml
+#
+# What it covers:
+#   1. Training loop   — 1 step  (train_max_samples: 4, batch_size: 4)
+#   2. Validation loop — runs once after the 1st step (evaluation_freq: 1),
+#                        loss/metrics only (eval_graspnet: false)
+#   3. Final test
+#        GraspNet1B  — test_mini split (90 scenes × 5 imgs), eval_mini()
+#        GraspClutter6D — full test split, eval_all()
+#
+__base__: '../paper/dav3s.yaml'
+
+training:
+  num_epochs: 1
+  batch_size: 4
+  num_workers: 2
+  print_freq: 1
+  evaluation_freq: 1      # trigger validation after the very first training step
+  checkpoint_freq: 1
+  validation:
+    split: test_mini
+    eval_graspnet: false  # skip GraspNet API call; just verify forward-pass metrics
+    batch_size: 4
+    num_workers: 2
+  final_test:
+    enabled: true
+    split: test_mini      # eval_mini(): 90 scenes × 5 imgs, much faster than full test
+    eval_graspnet: true
+    batch_size: 4
+    num_workers: 2
+    graspclutter6d:
+      enabled: true
+      batch_size: 4
+      num_workers: 2
+
+dataset:
+  train_max_samples: 4    # 1 training batch → 1 step → validation triggers once

@@ -1,0 +1,90 @@
+description: 'Eye-in-hand calibration: camera color optical frame in robot FLANGE
+  frame'
+frames:
+  parent: xarm7_flange
+  child: d435_color_optical
+usage: T_base_cam = T_base_flange @ T_flange_cam
+T_flange_cam:
+  matrix:
+  - - 0.010297937254002743
+    - -0.9999442621339808
+    - 0.0023291873349742176
+    - 0.13033161757805264
+  - - 0.9999410956155553
+    - 0.010289861226023267
+    - -0.0034531225162082574
+    - -0.0342604939849923
+  - - 0.0034289630320818052
+    - 0.002364610174630291
+    - 0.9999913253779988
+    - -0.037375795129398356
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  position_m:
+  - 0.13033161757805264
+  - -0.0342604939849923
+  - -0.037375795129398356
+  quaternion_xyzw:
+  - 0.002046377896473313
+  - -0.0003868442909354622
+  - 0.703456382247324
+  - 0.7107353804085641
+quality:
+  method: DANIILIDIS
+  num_samples: 30
+  board_pose_spread:
+    translation_rms_mm: 3.381152941564766
+    translation_max_mm: 6.360950313639133
+    rotation_max_deg: 0.9965100038137548
+    board_center_base:
+    - 0.2964013241797128
+    - 0.14380565690656122
+    - -0.0027158456126713673
+  leave_one_out_translation_dev_mm:
+    max: 3.7541217852637083
+    mean: 0.6707618238592337
+  all_methods:
+    TSAI:
+      translation_rms_mm: 3.400634724647531
+      translation_max_mm: 6.492217815750464
+    PARK:
+      translation_rms_mm: 3.43159326873565
+      translation_max_mm: 6.815380691799935
+    HORAUD:
+      translation_rms_mm: 3.4439797079827454
+      translation_max_mm: 6.869064759440302
+    DANIILIDIS:
+      translation_rms_mm: 3.381152941564766
+      translation_max_mm: 6.360950313639133
+camera_intrinsics:
+  D:
+  - 0.03741553562419559
+  - 1.0768375798616272
+  - 0.004757526790238009
+  - -0.00029541163529290843
+  - 0.0
+  K:
+  - - 943.6477698703321
+    - 0.0
+    - 645.5340413908328
+  - - 0.0
+    - 946.857381935605
+    - 377.124339194755
+  - - 0.0
+    - 0.0
+    - 1.0
+  distortion_model: distortion.inverse_brown_conrady
+  height: 720
+  width: 1280
+  source: calibrate_intrinsics.py (session ChArUco images, factory guess + FIX_K3)
+  calibration_rms_px: 0.22785293745260396
+board:
+  dictionary: DICT_6X6_250
+  squares_x: 5
+  squares_y: 7
+  square_len_m: 0.041
+  marker_len_m: 0.03276
+  legacy_pattern: false
+created: '2026-07-20T15:16:57'

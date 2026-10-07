@@ -1,0 +1,11 @@
+__base__: './dav2b.yaml'
+
+# Table IV Row 2 — Full FT + GeoFormer
+
+model:
+  backbone:
+    freeze: false
+  peft:
+    type: 'geoformer'
+    detach_depth: false
+    scale: 1.0

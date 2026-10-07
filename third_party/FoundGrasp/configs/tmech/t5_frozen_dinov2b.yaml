@@ -1,0 +1,11 @@
+__base__: './dinov2b.yaml'
+
+# Table V Row 5 — DINOv2-B, Frozen + GeoFormer
+# DA-V2 confound control: frozen DINOv2 (no depth pretraining) + GeoFormer.
+# If this matches DAv2-B frozen pattern, gain is from VFM freezing, not DAv2 priors.
+
+model:
+  peft:
+    type: 'geoformer'
+    detach_depth: false
+    scale: 1.0

@@ -1,0 +1,12 @@
+__base__: './dav2b.yaml'
+
+# Table VI Row 3 — Representation-level only (GeoFormer, no head depth)
+# GeoFormer injects geometry inside frozen ViT blocks; head uses visual features only.
+
+model:
+  peft:
+    type: 'geoformer'
+    detach_depth: false
+    scale: 1.0
+  grasp_head:
+    rgbd_fusion_type: 'none'

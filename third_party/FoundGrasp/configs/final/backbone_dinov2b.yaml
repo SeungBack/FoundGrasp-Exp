@@ -1,0 +1,8 @@
+__base__: './foundgrasp_base.yaml'
+
+# Backbone selection: DINOv2 Base.
+
+model:
+  backbone:
+    name: facebook/dinov2-base
+    freeze: true

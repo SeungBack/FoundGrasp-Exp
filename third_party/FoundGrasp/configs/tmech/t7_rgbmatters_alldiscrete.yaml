@@ -1,0 +1,16 @@
+__base__: './t7_discrete_view_angle_all_attrs.yaml'
+
+# Table VII Panel (a) — RGB Matters-style orientation + fully discrete attributes.
+# Same multi-label MSE orientation heatmap as t7_rgbmatters.yaml, but width/depth/
+# score are also discretized (bin classification). This is the "fully discrete"
+# corner of Panel (a). Fixed assignment, uniform propagation, no confidence
+# weighting (matched). Inference unchanged (argmax over the same logits).
+
+training:
+  loss_functions:
+    orientation:
+      type: mse
+      weight: 6.0
+      max_samples: 65536
+      chunk_size: 4096
+      symmetric_gripper: true

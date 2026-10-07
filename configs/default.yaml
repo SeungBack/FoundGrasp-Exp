@@ -1,0 +1,136 @@
+# exp_foundgrasp 기본 설정 — 모든 동작 옵션은 이 파일에서 바꾼다.
+#
+#   실행 시 일시 변경:  python run.py --set floor_limit.enabled=true --set live.enabled=false
+#   실험별 설정 파일:   configs/my_exp.yaml 에 `base: default.yaml` 을 두고 바꿀 항목만 기술
+#   경로 항목은 프로젝트 루트(exp_foundgrasp/) 기준 상대 경로 허용.
+
+# ---------------------------------------------------------------- 파지 검출 백엔드
+# 비교군 추가: efg/detectors/ 에 구현 + 레지스트리 등록 + 아래에 detector.<name> 블록
+detector:
+  name: foundgrasp
+  device: cuda
+  foundgrasp:
+    config: third_party/FoundGrasp/configs/final/foundgrasp_base.yaml
+    checkpoint: third_party/FoundGrasp/logs/final/foundgrasp_base/checkpoints/final_model.pth
+    top_k: 50
+    nms: true
+    collision_detection: true
+    collision_voxel_size: 0.01
+
+# ---------------------------------------------------------------- 캘리브레이션
+# hand-eye(T_flange_cam)와 카메라 K. 카메라 마운트를 바꾸면 재캘리브레이션 필수
+# (02.dev/hand_eye_calib 참조). intrinsics를 null로 두면 카메라 스트림 K 사용 —
+# hand-eye와 같은 K를 써야 역투영 좌표가 일관된다.
+calib:
+  hand_eye: configs/calib/hand_eye.yaml
+  intrinsics: configs/calib/intrinsics.yaml
+
+# ---------------------------------------------------------------- 로봇 (xArm7)
+# 전제: xArm Studio에 TCP offset = 그리퍼 끝, TCP payload = 그리퍼 질량 설정
+robot:
+  ip: "192.168.1.214"
+  # 스캔(홈) 자세 — 카메라가 박스 중심 상방에 수직으로 오도록
+  # scripts/align_scan_pose.py(자동) 또는 teach_scan_pose.py(수동)로 갱신
+  home_joints_deg: [-11.18, -22.16, -17.76, 77.08, -6.72, 98.24, -28.69]
+  home_joint_speed_deg_s: 126 # 조인트 최대 180 deg/s의 70%
+  travel_speed_mm_s: 700      # 홈 <-> pre-grasp 이동 (TCP 최대 1000 mm/s의 70%)
+  lift_speed_mm_s: 700
+  approach_speed_mm_s: 100    # pre-grasp -> grasp 접근: 저속·저가속 (접촉 충격 최소화)
+  approach_acc_mm_s2: 500     # 접근 중 TCP 최대 가속도
+  default_acc_mm_s2: 5000     # 접근 후 복원할 기본 가속도
+  # tcp_payload: {weight_kg: 1.9, com_mm: [7, 1, 48]}   # 지정 시 연결마다 컨트롤러에 설정
+
+# ---------------------------------------------------------------- 카메라 (D435)
+camera:
+  width: 1280
+  height: 720
+  fps: 30
+  warmup_frames: 15
+  postprocess: true           # depth 후처리: disparity→spatial→temporal (RealSense 기본 파라미터)
+
+# ---------------------------------------------------------------- 그리퍼 (KORAS 2FPA-I-03-100)
+# 운용 규칙: 전원 투입 후 그리퍼 본체 버튼(I)으로 초기화. Modbus 초기화(101) 금지 —
+# grip_close 방향 학습을 손상시키는 것이 실측 확인됨 (2026-07-21, 버튼 초기화로만 복구).
+gripper:
+  # by-id 고정 경로 — /dev/ttyACM* 번호는 재연결마다 바뀐다. 보드 교체 시 S/N 갱신
+  # (`ls -l /dev/serial/by-id/`). 권한: 계정을 dialout 그룹에 추가
+  port: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7A101355-if00"
+  slave_id: 1
+  grip_mode: "grip"           # "grip": 펌웨어 힘 제어(기본). "position": 위치 지정만 (펌웨어 이상 시 폴백)
+  initialize_on_connect: false  # 반드시 false (위 운용 규칙)
+  close_probe_on_connect: true  # 연결 시 close 방향 실측 점검 — 방향 손상 상태로 로봇이 움직이는 것 차단
+  force_pct: 80               # 그립 힘 (50~100)
+  speed_pct: 100
+  stroke_mm: 100.0            # 전체 스트로크. 팁 교체 시 실측 갱신
+  pre_open_margin_mm: 3       # 접근 시 개방 폭 = 목표 그립 폭 + 여유(mm)
+  grip_success_min_pct: 2.0   # close 후 finger 위치가 이보다 크면 파지 성공 (간격 판정).
+                              # 플렉스 팁은 이 판정이 부정확 — payload_check 병용 또는
+                              # grip_check.enabled: false 로 판정 미적용
+
+# ---------------------------------------------------------------- 후보 선정
+selection:
+  min_score: 0.1
+  workspace_x_m: [0.15, 0.60]   # base 좌표계 작업 공간 (m) — 밖의 그립 지점 제외
+  workspace_y_m: [-0.35, 0.35]
+  workspace_z_m: [-0.01, 0.35]
+  approach_max_tilt_deg: 25     # 접근 방향과 수직(base -z)의 최대 각도. 29°에서 self-collision 실측
+  max_grasp_width_m: 0.095      # 그리퍼 최대 개방보다 넓은 그립 제외
+  pre_grasp_offset_m: 0.10      # 접근 방향 반대로 물러난 pre-grasp 거리
+  use_grasp_depth: true         # 검출기가 예측한 그립별 depth 반영
+  approach_extra_m: 0.04        # 추가 삽입 여유 (m). 파지가 얕으면 키우고, 충돌하면 줄일 것
+  lift_height_m: 0.15           # 그립 후 수직 상승 높이
+  ik_check_per_candidate: true
+  j7_limit_deg: [-89, 90]       # J7 허용 범위 — 179° 폭이라 closing_sign ± 중 한쪽만 통과 (케이블 꼬임 방지)
+  score_tie_tolerance: 0.08     # 최고 score와 이 차이 이내 후보 중 가장 수직인 것 선택 (0=순수 score 순)
+  camera_up:                    # 손목 카메라 하향 자세 배제 (바닥·박스 충돌 방지)
+    prefer: true                # closing_sign 두 해 중 카메라가 위로 가는 쪽 우선
+    max_down_deg: 20            # 카메라 측면 방향이 수평 아래로 이보다 기울면 탈락
+
+# ---------------------------------------------------------------- 작업 장면
+# 스캔 영역 (컬러 이미지 픽셀 [x1, y1, x2, y2]) — 물체 박스 내부. scripts/set_roi.py 로 지정
+scan_roi_px: [188, 11, 1093, 712]
+
+# 릴리즈(놓는 박스 상방) 자세 — scripts/teach_drop.py 로 티칭
+drop:
+  joints_deg: [17.72, 7.1, 13.13, 82.38, -1.26, 76.13, 30.97]
+  joint_speed_deg_s: 180      # 파지 후 이송(경유·릴리즈) 조인트 속도
+  via_blend_radius: 50        # 경유 블렌딩 반경 — 클수록 완만하게 통과
+  via_height_m: 0.35          # 이송 경유점 높이 (base z, m) — 박스 테두리보다 높게.
+                              # 상승 지점이 이미 이보다 높으면 경유 없이 직행
+
+retry:
+  max_fail_streak: 3          # 연속 실패/선정불가 한도 — 도달 시 사용자 입력 대기
+  exclude_radius_m: 0.02      # 직전 실패 그립 지점 반경 내 후보 제외 (base 좌표계)
+
+# ---------------------------------------------------------------- 파지 성공 판정
+# false면 판정 결과(finger 간격·페이로드 Δ)를 출력만 하고 실패 분기 없이 항상 이송.
+# 판정 기준을 실측으로 잡는 동안의 자료 수집용
+grip_check:
+  enabled: false
+
+# 릴리즈 자세에서 관절 중력 토크와 빈 손 기준값 비교 — 팁 변형과 무관한 판정.
+# scripts/calib_payload.py 로 기준값 측정 후 enabled: true (릴리즈 자세 재티칭 시 재실행)
+payload_check:
+  enabled: false
+  baseline_path: configs/calib/payload_baseline.npz
+  min_delta_nm: null          # null이면 캘리브레이션 권장값 (샘플 물체 신호의 35%)
+  samples: 12                 # 판정당 토크 표본 수 (중앙값)
+  settle_s: 0.4               # 릴리즈 자세 도착 후 잔진동 안정화 대기
+
+# ---------------------------------------------------------------- 안전 옵션
+# 빈 박스 높이맵 기반 하강 제한 — scripts/scan_box_floor.py 로 맵 생성 후 enabled: true.
+# 선정 그립의 TCP·핑거 끝이 (표면 z + clearance) 아래로 가지 않게 삽입량을 축소하고,
+# min_insertion 밑으로 줄여야 하면 후보를 탈락시켜 재선정
+floor_limit:
+  enabled: false
+  map_path: configs/calib/box_floor.npz
+  clearance_m: 0.008
+  min_insertion_m: 0.010
+
+# ---------------------------------------------------------------- 모니터링·산출물
+live:
+  enabled: true               # OpenCV 라이브 창 (컬러 + ROI/상태/선정 그립). q로 정지 요청
+
+output:
+  dir: outputs
+  save_cycles: false          # true면 사이클별 후보/선정 오버레이 저장 (outputs/cycleNNN_grasps.jpg)

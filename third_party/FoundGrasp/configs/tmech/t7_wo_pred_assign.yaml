@@ -1,0 +1,9 @@
+__base__: './t7_wo_conf.yaml'
+
+# Table VII R2 — Ablation: prediction-aware view assignment OFF
+# Baseline (t7_wo_conf.yaml): propagate=true, confidence=false, prediction_aware=true
+# Change: all heads use fixed top-1 view (k=0) for gripper/width/depth/score targets
+
+training:
+  loss_functions:
+    prediction_aware_assignment: false

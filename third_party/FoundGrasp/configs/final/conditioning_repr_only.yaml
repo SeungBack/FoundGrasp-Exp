@@ -1,0 +1,8 @@
+__base__: './foundgrasp_base.yaml'
+
+# Table VI — Representation-level only: GeoFormer injects geometry inside the frozen
+# ViT blocks, while the grasp head uses visual features only (no head depth fusion).
+
+model:
+  grasp_head:
+    rgbd_fusion_type: 'none'

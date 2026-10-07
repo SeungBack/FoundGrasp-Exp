@@ -1,0 +1,10 @@
+__base__: './dav2b.yaml'
+
+# Table IV Row 1 — Full FT, no adapter
+# DAv2-B unfrozen, no PEFT module. FT reference for C1 isolation (vs Row 3).
+
+model:
+  backbone:
+    freeze: false
+  peft:
+    type: 'none'

@@ -1,0 +1,21 @@
+D:
+- 0.03741553562419559
+- 1.0768375798616272
+- 0.004757526790238009
+- -0.00029541163529290843
+- 0.0
+K:
+- - 943.6477698703321
+  - 0.0
+  - 645.5340413908328
+- - 0.0
+  - 946.857381935605
+  - 377.124339194755
+- - 0.0
+  - 0.0
+  - 1.0
+distortion_model: distortion.inverse_brown_conrady
+height: 720
+width: 1280
+source: calibrate_intrinsics.py (session ChArUco images, factory guess + FIX_K3)
+calibration_rms_px: 0.22785293745260396

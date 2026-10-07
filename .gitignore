@@ -1,0 +1,33 @@
+# 실행 산출물
+outputs/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# FoundGrasp 체크포인트 (377MB — 별도 배포, README 설치 절 참조)
+third_party/FoundGrasp/logs/
+third_party/**/*.pth
+third_party/**/*.pt
+
+# 편집기·개인 설정
+.vscode/
+.claude/
+CLAUDE.local.md
+
+# Python 환경·빌드
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+
+# 환경변수·비밀값
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,25 @@
+__base__: './foundgrasp_vitb.yaml'
+
+# Table VII — Clean leave-one-out ablation from the confidence-weighted Full model.
+# Removes the complete kappa subsystem while keeping propagation,
+# confidence weighting, prediction-aware assignment, and antipodal symmetry.
+
+model:
+  grasp_head:
+    use_kappa: false
+
+training:
+  loss_functions:
+    propagate_gt: true
+    confidence_weighting: true
+    prediction_aware_assignment: true
+    approach:
+      type: acosine_similarity
+      weight: 3.0
+    gripper:
+      type: symmetric_acosine_similarity
+      weight: 3.0
+
+inference:
+  approach_kappa_risk_weight: 0.0
+  gripper_kappa_risk_weight: 0.0

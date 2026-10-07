@@ -1,0 +1,7 @@
+__base__: './t4_frozen_geoformer.yaml'
+
+# Table II — FoundGrasp DAv2-Base (Kinect)
+# Same model as t4_frozen_geoformer; trained and evaluated on Kinect sensor data.
+
+dataset:
+  camera: 'kinect'

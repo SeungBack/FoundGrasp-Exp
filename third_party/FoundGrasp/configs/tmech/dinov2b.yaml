@@ -1,0 +1,11 @@
+__base__: '../_base.yaml'
+
+
+model:
+  backbone:
+    name: facebook/dinov2-base
+    freeze: True
+  peft:
+    type: 'none'
+    bottleneck: 96
+    drop_path: 0.2

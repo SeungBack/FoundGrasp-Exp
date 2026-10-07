@@ -1,0 +1,9 @@
+__base__: './adapter_ft_geoformer.yaml'
+
+# Table IV — Full fine-tuning + GeoFormer, with layer-wise LR decay (LLRD 0.65).
+# Fair-LR variant: head/adapter stay at base LR (2e-4, matched to frozen);
+# backbone LR decays layer-by-layer (0.65 = ViT-B convention).
+# Addresses the "FT baseline tuned unfairly" reviewer concern.
+
+training:
+  layer_decay_rate: 0.65

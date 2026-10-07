@@ -1,0 +1,16 @@
+__base__: '../_base.yaml'
+
+# Table V — SAM-ViT-B, Frozen + GeoFormer
+# pos_embed resized to training resolution (360x640) via bilinear interpolation
+# and kept trainable; all other backbone weights frozen (see found_grasp.py:478).
+
+model:
+  backbone:
+    name: facebook/sam-vit-base
+    freeze: True
+  peft:
+    type: 'geoformer'
+    bottleneck: 96
+    drop_path: 0.2
+    detach_depth: false
+    scale: 1.0

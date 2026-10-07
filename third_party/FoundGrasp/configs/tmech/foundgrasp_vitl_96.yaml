@@ -1,0 +1,18 @@
+__base__: './t1_dav2l.yaml'
+
+# Experiment A: isolate the DAv2-L first-tap fix.
+# Baseline to compare: logs/tmech/foundgrasp_vitl_0.2
+# Only change vs that baseline: Large DPT taps [5,11,17,23] -> [4,11,17,23].
+
+model:
+  decoder:
+    name: DPT
+    out_indices: [4, 11, 17, 23]
+  peft:
+    type: 'geoformer'
+    detach_depth: false
+    scale: 1.0
+    bottleneck: 96
+    drop_path: 0.2
+  grasp_head:
+    name: ParallelGraspHead

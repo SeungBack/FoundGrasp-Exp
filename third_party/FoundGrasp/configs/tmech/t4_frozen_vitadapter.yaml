@@ -1,0 +1,19 @@
+__base__: './dav2b.yaml'
+
+# Table IV Row 6 — Frozen + ViT-Adapter (RGB SPM)
+
+model:
+  peft:
+    type: 'vit_adapter'
+    num_interactions: 4
+    num_heads: 6
+    n_points: 4
+    inplanes: 64
+    with_cffn: true
+    cffn_ratio: 0.25
+    deform_ratio: 0.5
+    dropout: 0.0
+    init_scale: 0.0
+    add_level_embed: true
+    use_extra_extractor: true
+    spm_pool_factor: 2

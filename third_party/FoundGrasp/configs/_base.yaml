@@ -1,0 +1,172 @@
+
+# Random seed for reproducibility
+seed: 777
+
+model:
+  input_type: 'xyz'
+  backbone:
+    name: depth-anything/Depth-Anything-V2-Base-hf
+    freeze: True
+  depth_backbone: 'resnet34'
+  depth_confidence:
+    type: 'none'
+    hidden_dim: 64
+    apply_to_depth_feat: true
+    apply_to_peft: true
+    score_calibration: false
+  decoder:
+    name: DPT
+    norm_type: group
+    fusion_type: 'none'
+  prompt:
+    mode: 'none'
+    num_prompts: 0
+    use_deep: false
+  grasp_head:
+    name: ParallelGraspHead
+    head_dim: 128
+    num_trunk_layers: 2
+    num_hidden_layers: 1
+    num_head_layers: 1
+    rgbd_fusion_type: 'concat'
+    use_kappa: true
+  peft:
+    type: "geoformer"
+    bottleneck: 64
+    dropout: 0.0
+    scale: 1.0
+    geo_gate_type: "channel"
+    detach_depth: false
+    layers: "all"
+    drop_path: 0.2
+
+datasets:
+  GraspNet1B:
+    root: '/data/Grasp/GraspNet-1Billion'
+  GraspClutter6D:
+    root: '/data/Grasp/GraspClutter6D'
+
+dataset:
+  name: GraspNet1B
+  camera: 'realsense'
+  split: train
+  image_size: [360, 640]
+
+
+training:
+  batch_size: 64
+  num_epochs: 150
+  learning_rate: 2e-4
+  weight_decay: 0.05
+  # With DDP (N GPUs): set learning_rate = 2e-4 * N (linear scaling rule)
+  num_workers: 8  # per GPU; total = num_workers * N_gpus
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  scheduler: cosine
+  use_amp: true
+  amp_dtype: 'bfloat16'
+  grad_clip: 1.0
+  color_aug_strength: 2.5
+
+  warmup:
+    epochs: 5
+    start_factor: 0.01
+
+  ddp:
+    enabled: false
+    backend: nccl
+    find_unused_parameters: false
+    broadcast_buffers: true
+
+  # Loss Function Types
+  # Available types: bce, bce_with_logits, smooth_l1, l1, l2, cross_entropy, cosine_similarity
+  loss_functions:
+    propagate_gt: true
+    confidence_weighting: true
+    quality_aware:
+      enabled: false
+      min_weight: 0.2
+      targets: ['approach', 'gripper', 'score', 'width', 'depth']
+    prop_radius: 5
+    prop_depth_thresh: 0.005
+    objectness:
+      type: bce_with_logits
+      weight: 1.0
+    graspness:
+      type: smooth_l1
+      beta: 0.1
+      weight: 1.0
+    approach:
+      type: angmf
+      weight: 3.0
+    gripper:
+      type: symmetric_angmf
+      weight: 3.0
+    width:
+      type: smooth_l1
+      beta: 0.1
+      weight: 1.0
+    depth:
+      type: smooth_l1
+      beta: 0.1
+      weight: 1.0
+    score:
+      type: smooth_l1
+      weight: 3.0
+
+  # Logging and visualization
+  print_freq: 100  # Print every N batches
+  visualize_freq: 10000  # Visualize predictions every N steps
+  evaluation_freq: 100000  # Run evaluation every N steps
+  checkpoint_freq: 50  # Save checkpoint every N epochs
+  validation:
+    split: test_mini_mixed
+    ann_ids_path: mini_mixed_ann_ids.json
+    batch_size: 16
+    num_workers: 8
+    eval_graspnet: true
+    save_visualizations: false
+  final_test:
+    enabled: true
+    split: test
+    batch_size: 16
+    num_workers: 6
+    eval_graspnet: true
+    save_visualizations: false
+    graspclutter6d:
+      enabled: true
+      batch_size: 16
+      num_workers: 8
+  augmentation: 'crop,color,hflip,vflip'
+
+# Inference configuration
+inference:
+  use_collision_detection: true
+  graspness_threshold: 0.01
+  total_score_threshold: 0.01
+  # Base score: (graspness ** graspness_exp) * (grasp_score ** grasp_score_exp)
+  # Kappa reranking: multiply by exp(-lambda * E[angular_error]).
+  # segm gates candidates via hard mask + erosion; excluded from ranking score.
+  graspness_exp: 0.2
+  grasp_score_exp: 1.5
+  approach_kappa_risk_weight: 0.5
+  gripper_kappa_risk_weight: 1.0
+  width_multiplier: 1.2       # grasp width scaling factor
+  nms_type: 'voxel'           # 'pixel' or 'voxel'
+  voxel_size: 0.004           # voxel NMS grid size (m)
+  z_max: 1.5                  # max grasp z (m); removes far/invalid regions
+  objectness_threshold: 0.5
+  empty_grasp_min_points: 10
+  segm_erosion_k: 3           # morphological erosion on objectness mask; removes boundary grasps
+  gamma_max_abs_deg: 30.0
+  depth_edge_thresh: 0.00             # suppress grasps near depth discontinuities (m); 0=off
+  depth_edge_k: 7                    # kernel size for local depth range computation
+  max_grasps: 4096
+
+# Wandb configuration
+wandb:
+  project: FoundGrasp
+  entity: null  # Set to your wandb username/team or leave null for default
+  mode: online  # online, offline, or disabled
+  backend: comet  # 'comet' or 'wandb'

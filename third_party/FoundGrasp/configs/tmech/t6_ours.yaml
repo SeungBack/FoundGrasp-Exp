@@ -1,0 +1,5 @@
+__base__: './t4_frozen_geoformer.yaml'
+
+# Table VI Row 4 — Representation + Prediction (Ours)
+# GeoFormer (repr-level) + head depth fusion (pred-level).
+# Identical experiment to t4_frozen_geoformer.yaml — aliased for Table VI runs.

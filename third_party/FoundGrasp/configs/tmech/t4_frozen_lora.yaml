@@ -1,0 +1,10 @@
+__base__: './dav2b.yaml'
+
+# Table IV Row 4 — Frozen + LoRA
+
+model:
+  peft:
+    type: 'lora'
+    r: 32
+    alpha: 64
+    dropout: 0.0

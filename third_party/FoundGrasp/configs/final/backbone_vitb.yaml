@@ -1,0 +1,8 @@
+__base__: './foundgrasp_base.yaml'
+
+# Backbone selection: SAM ViT-Base.
+
+model:
+  backbone:
+    name: google/vit-base-patch16-224
+    freeze: true

@@ -1,0 +1,25 @@
+__base__: './t7_wo_conf.yaml'
+
+# Table VII — Joint Discrete Orientation Field baseline.
+# Same frozen VFM, GeoFormer, RGB-D fusion, dense propagation, and scalar
+# width/depth/score regressors as FoundGrasp. Only orientation changes from
+# continuous approach/gripper vectors to a GraspNet-style joint view-angle class.
+
+model:
+  grasp_head:
+    name: DiscreteJointOrientationGraspHead
+    num_views: 300
+    num_angles: 12
+    use_kappa: false
+
+training:
+  loss_functions:
+    prediction_aware_assignment: false
+    confidence_weighting: false
+    orientation:
+      type: cross_entropy
+      weight: 6.0
+      normalize_by_log_classes: true
+      max_samples: 65536
+      chunk_size: 4096
+      symmetric_gripper: true

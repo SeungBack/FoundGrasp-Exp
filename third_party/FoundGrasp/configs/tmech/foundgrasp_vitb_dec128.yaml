@@ -1,0 +1,12 @@
+__base__: './foundgrasp_vitb.yaml'
+
+# Base control for the downstream-capacity experiment.
+# Identical to vitb (61.61) EXCEPT the same widened grasp pathway as
+# foundgrasp_vitl_dec128: feature_dim 64->128, out_channels [96,192,384,768].
+# If Large gains much more from this than Base, the gap was downstream-limited.
+
+model:
+  decoder:
+    name: DPT
+    feature_dim: 128
+    out_channels: [96, 192, 384, 768]

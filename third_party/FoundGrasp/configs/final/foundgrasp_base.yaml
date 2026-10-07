@@ -1,0 +1,35 @@
+__base__: '../_base.yaml'
+
+# Shared FoundGrasp recipe.
+# Backbone selection configs should override only model.backbone.
+
+model:
+  backbone:
+    name: depth-anything/Depth-Anything-V2-Base-hf
+    freeze: true
+  peft:
+    type: 'geoformer'
+    bottleneck: 96
+    drop_path: 0.2
+    use_ln: false
+    detach_depth: false
+    scale: 1.0
+  grasp_head:
+    use_kappa: false
+
+
+training:
+  loss_functions:
+    propagate_gt: true
+    confidence_weighting: true
+    prediction_aware_assignment: true
+    approach:
+      type: acosine_similarity
+      weight: 3.0
+    gripper:
+      type: symmetric_acosine_similarity
+      weight: 3.0
+
+inference:
+  approach_kappa_risk_weight: 0.0
+  gripper_kappa_risk_weight: 0.0

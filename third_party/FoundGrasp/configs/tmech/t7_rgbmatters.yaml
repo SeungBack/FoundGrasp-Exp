@@ -1,0 +1,19 @@
+__base__: './t7_discrete_view_angle.yaml'
+
+# Table VII Panel (a) — RGB Matters-style discrete orientation baseline.
+# Joint 300x12 (view x angle) MULTI-LABEL heatmap regressed with plain MSE
+# toward a binary {0,1} target: each valid grasp at a pixel marks its quantized
+# (view, angle) class as positive (multiple positives per pixel = multimodal).
+# Matches RGB Matters (Gou et al., ICRA'21): nn.MSELoss on a boolean V*A grid,
+# no sigmoid, no positive weighting. Continuous width/depth/score, fixed
+# assignment, uniform propagation, no confidence weighting (matched to the other
+# Panel (a) rows). Inference is unchanged (argmax over the same logits).
+
+training:
+  loss_functions:
+    orientation:
+      type: mse
+      weight: 6.0
+      max_samples: 65536
+      chunk_size: 4096
+      symmetric_gripper: true

@@ -1,0 +1,22 @@
+# python ignore
+.vscode/
+.claude/
+checkpoints/
+logs/
+runs/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.png
+ckpts/
+
+*.npy
+*.npz
+*.png
+*.jpg

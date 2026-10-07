@@ -1,0 +1,10 @@
+__base__: './dav2b.yaml'
+
+# Table VI Row 1 — No geometric input (frozen ViT, visual only)
+# No adapter, no head depth. Establishes the zero-geometry baseline.
+
+model:
+  peft:
+    type: 'none'
+  grasp_head:
+    rgbd_fusion_type: 'none'

@@ -1,0 +1,6 @@
+__base__: './foundgrasp_small.yaml'
+
+# Table II — Ours DAv2-S (GraspNet-1B, Kinect). Same model, trained/evaluated on Kinect.
+
+dataset:
+  camera: 'kinect'

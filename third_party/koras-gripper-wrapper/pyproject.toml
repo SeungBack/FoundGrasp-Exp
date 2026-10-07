@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "koras_gripper_wrapper"
+version = "0.1.0"
+description = "Minimal Modbus RTU Python wrapper for the KORAS Robotics 2FPA-I-03-100 (KR-DATC) gripper"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Raeyo Kang", email = "raeyo.kang@gmail.com" }]
+keywords = ["koras", "gripper", "datc", "modbus", "robotics"]
+dependencies = [
+    "pymodbus>=3.6",
+    "pyserial>=3.5",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+
+[tool.setuptools]
+packages = ["koras_gripper_wrapper"]

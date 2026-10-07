@@ -1,0 +1,11 @@
+__base__: './t7_wo_conf.yaml'
+
+# Table VII R3 — Ablation: antipodal symmetry OFF
+# Baseline (t7_wo_conf.yaml): propagate=true, confidence=false, gripper=symmetric_angmf
+# Change: gripper loss -> angmf (no |cos|)
+
+training:
+  loss_functions:
+    gripper:
+      type: angmf
+      weight: 3.0

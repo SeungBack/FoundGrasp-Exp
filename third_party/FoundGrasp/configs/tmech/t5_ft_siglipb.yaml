@@ -1,0 +1,11 @@
+__base__: './siglipb.yaml'
+
+# Table V — SigLIP-B, Full FT + GeoFormer
+
+model:
+  backbone:
+    freeze: false
+  peft:
+    type: 'geoformer'
+    detach_depth: false
+    scale: 1.0

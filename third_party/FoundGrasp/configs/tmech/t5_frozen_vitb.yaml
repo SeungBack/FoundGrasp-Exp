@@ -1,0 +1,9 @@
+__base__: './vitb.yaml'
+
+# Table V — ViT-B (ImageNet supervised), Frozen + GeoFormer
+
+model:
+  peft:
+    type: 'geoformer'
+    detach_depth: false
+    scale: 1.0

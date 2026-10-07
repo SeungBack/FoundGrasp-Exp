@@ -1,0 +1,26 @@
+# Vendored official sources / docs (not part of this package)
+KR_GCS_user_interface/
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tooling / editors
+.claude/
+.vscode/
+.idea/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

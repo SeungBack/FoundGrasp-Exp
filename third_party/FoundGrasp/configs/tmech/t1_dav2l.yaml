@@ -1,0 +1,15 @@
+__base__: '../_base.yaml'
+
+# Table I — FoundGrasp DAv2-Large (RealSense)
+# Frozen DAv2-L backbone + GeoFormer adapter.
+
+model:
+  backbone:
+    name: depth-anything/Depth-Anything-V2-Large-hf
+    freeze: True
+  peft:
+    type: 'geoformer'
+    bottleneck: 192
+    drop_path: 0.3
+    detach_depth: false
+    scale: 1.0

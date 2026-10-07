@@ -1,0 +1,14 @@
+__base__: './supervision_discrete_orientation.yaml'
+
+# Table VII: RGB Matters-style orientation objective.
+# Same joint 300-view x 12-angle output as supervision_discrete_orientation,
+# but trained as a multi-label MSE heatmap over all valid orientation modes.
+
+training:
+  loss_functions:
+    orientation:
+      type: mse
+      weight: 6.0
+      max_samples: 65536
+      chunk_size: 4096
+      symmetric_gripper: true

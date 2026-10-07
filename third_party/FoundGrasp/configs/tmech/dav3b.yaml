@@ -1,0 +1,10 @@
+__base__: '../_base.yaml'
+
+
+model:
+  backbone:
+    name: depth-anything/DA3-BASE
+    freeze: True
+  peft:
+    bottleneck: 96
+    drop_path: 0.2
