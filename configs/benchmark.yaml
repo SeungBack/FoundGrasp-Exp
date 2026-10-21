@@ -1,0 +1,23 @@
+# Shared real-robot execution protocol for FoundGrasp / AnyGrasp.
+# Change only detector.name between runs. Motion/calibration come from default.yaml.
+# FoundGrasp keeps its final width; AnyGrasp receives the shared execution margin.
+# This is not a byte-for-byte reproduction of the simulator's raw-width protocol.
+base: default.yaml
+detector:
+  name: anygrasp
+  foundgrasp:
+    nms: false
+    top_k: 0
+  anygrasp:
+    args: [--sdk_dir, ~/Workspaces/anygrasp_sdk,
+           --checkpoint, ~/Workspaces/anygrasp_sdk/ckpts/checkpoint_detection.tar,
+           --no-nms, --seed, '0', --gripper_height, '0.02']
+postprocess:
+  protocol: common
+  collision:
+    enabled: true
+    voxel_size_m: 0.01
+    approach_dist_m: 0.05
+    thresh: 0.01
+output:
+  save_cycles: true

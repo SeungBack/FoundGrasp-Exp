@@ -44,9 +44,22 @@ def test_base_inheritance_and_null(tmp_path):
                      "live: {enabled: true}\n")
     cfg = load_config(child)
     assert cfg["selection"]["approach_max_tilt_deg"] == 15
-    assert cfg["selection"]["lift_height_m"] == 0.15  # null = 미설정 → base 유지
+    assert cfg["selection"]["lift_height_m"] == load_config()["selection"]["lift_height_m"]
     assert cfg["live"]["enabled"] is True
     assert cfg["robot"]["ip"]  # 나머지는 base에서
+
+
+def test_detector_cli_alias_overrides_only_name():
+    import argparse
+    from efg.config import add_config_args, config_from_args
+    args = add_config_args(argparse.ArgumentParser()).parse_args([
+        '--config', 'configs/benchmark.yaml', '--grasp-detector', 'foundgrasp'])
+    cfg = config_from_args(args)
+    assert cfg['detector']['name'] == 'foundgrasp'
+    assert cfg['detector']['foundgrasp']['top_k'] == 0
+    assert cfg['detector']['foundgrasp']['nms'] is False
+    assert cfg['robot'] == load_config()['robot']
+    assert cfg['postprocess']['protocol'] == 'common'
 
 
 def test_set_yaml_line_keeps_indent_and_other_keys(tmp_path):

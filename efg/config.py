@@ -119,8 +119,13 @@ def add_config_args(ap):
                     help="설정 파일 (기본 configs/default.yaml)")
     ap.add_argument("--set", metavar="KEY=VALUE", action="append", default=[],
                     help="설정 항목 일시 변경 (반복 가능, 예: --set live.enabled=false)")
+    ap.add_argument("--grasp-detector", default=None,
+                    help="검출기 선택 (detector.name과 동일; --set보다 우선)")
     return ap
 
 
 def config_from_args(args):
-    return load_config(args.config, args.set)
+    cfg = load_config(args.config, args.set)
+    if getattr(args, 'grasp_detector', None):
+        cfg['detector']['name'] = args.grasp_detector
+    return cfg

@@ -1,15 +1,16 @@
 """실행 계층 — 하드웨어 한계와 방법별 출력 계약을 적용.
 
-논문 시뮬 벤치마크(Workspaces/FoundGrasp/sim/run_clutter_removal.py, ext/BASELINES.md
-"width 규약")는 비교군에 적용한다. FoundGrasp 독립 detect() 출력에는
-추가 공유 충돌 검사와 폭 마진을 적용하지 않는다.
+legacy: FoundGrasp 독립 detect() 출력에는 추가 공유 충돌 검사를 적용하지 않는다.
+common: FoundGrasp / AnyGrasp 모두 동일한 공유 충돌 검사를 적용한다.
+FoundGrasp 출력 폭은 그대로 실행하고 AnyGrasp에는 실행 개방 마진을 곱한다.
+기존 EconomicGrasp/RNGNet/HGGD의 raw-width 계약은 유지한다.
 
   입력  ROI 밖 depth = 0 (전 방법 동일 입력. 비교군 점군 계열의 workspace crop 과 같은 의미)
-  1) 폭 한계 필터   raw width <= max_open_m (한계 밖 후보는 클립 실행이 아니라 배제)
+  1) 폭 한계 필터   width <= max_open_m (한계 밖 후보는 클립 실행이 아니라 배제)
   2) 공유 충돌필터  ModelFreeCollisionDetector(voxel 0.01, approach 0.05, thresh 0.01),
                    장면 점군은 마스킹 전 전체 depth (ROI 밖 박스 벽도 장애물로 본다)
   3) score 내림차순 정렬 → (호출자) ROI 투영 필터 → 선정(기하·IK, 순위 순)
-  실행  개방 폭 = min(open_multiplier x raw width, max_open_m)
+  실행  FoundGrasp는 min(width, max_open_m); 나머지는 open_multiplier 마진 적용
 """
 import numpy as np
 
@@ -17,7 +18,8 @@ from .paths import FOUNDGRASP_ROOT, add_vendor_paths, import_grasp_group
 from .console import detail
 
 def uses_standalone_foundgrasp(cfg):
-    return cfg.get("detector", {}).get("name") == "foundgrasp"
+    return (cfg.get("detector", {}).get("name") == "foundgrasp"
+            and cfg.get("postprocess", {}).get("protocol", "legacy") == "legacy")
 
 
 CD_CHUNK = 256  # 후보 묶음 크기 — 후보별 독립 계산이라 결과 동일, 메모리만 제한
@@ -54,7 +56,7 @@ def shared_filter(gg, depth_full, K, cfg):
     pp = cfg["postprocess"]
     counts = {"detected": len(gg)}
     rejected_score = 0
-    if len(gg) and uses_standalone_foundgrasp(cfg):
+    if len(gg) and (uses_standalone_foundgrasp(cfg) or pp.get("protocol") == "common"):
         # Rejected zero-score grasps may survive upstream top-k; never execute them.
         rejected_score = int(np.count_nonzero(~(gg.scores > 0)))
         gg = _subset(gg, gg.scores > 0)
@@ -122,8 +124,9 @@ def shared_filter(gg, depth_full, K, cfg):
 
 
 def open_width_m(raw_width_m, cfg):
-    """실행 개방 폭 = min(open_multiplier x raw, max_open_m)."""
+    """Apply execution margin once to AnyGrasp/baselines, never twice to FoundGrasp."""
     pp = cfg["postprocess"]
-    multiplier = 1.0 if uses_standalone_foundgrasp(cfg) else float(pp.get("open_multiplier", 1.2))
+    multiplier = (1.0 if cfg.get("detector", {}).get("name") == "foundgrasp"
+                  else float(pp.get("open_multiplier", 1.2)))
     return float(min(multiplier * float(raw_width_m),
                      float(pp["max_open_m"])))

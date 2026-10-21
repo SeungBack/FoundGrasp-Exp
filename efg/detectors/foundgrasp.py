@@ -48,6 +48,10 @@ class FoundGraspDetector(GraspDetector):
         self.inf_cfg = self.impl.config.get("inference", {})
         self.collision = bool(cfg.get("collision_detection", True))
         self.collision_voxel = float(cfg.get("collision_voxel_size", 0.01))
+        self.final_nms = bool(cfg.get("nms", True))
+        self.top_k = int(cfg.get("top_k", 50))
+        if self.top_k < 0:
+            raise ValueError("detector.foundgrasp.top_k must be >= 0 (0 = unlimited)")
 
         rf = cfg.get("refiner") or {}
         self.refiner = None
@@ -78,9 +82,10 @@ class FoundGraspDetector(GraspDetector):
         self.refiner_env = env
 
     def describe(self):
+        tail = f"NMS={self.final_nms}, top-k={self.top_k or 'all'}"
         if self.refiner is None:
-            return "foundgrasp (standalone, GPU CD, grasp NMS, top-50)"
-        return f"foundgrasp (standalone +refiner, grasp NMS, top-50, max_w {self.refiner_max_w * 1000:.0f}mm)"
+            return f"foundgrasp (GPU CD={self.collision}, {tail})"
+        return f"foundgrasp (+refiner, {tail}, max_w {self.refiner_max_w * 1000:.0f}mm)"
 
     def detect(self, rgb, depth_m, K):
         self.last_refiner_ms = None
@@ -91,7 +96,8 @@ class FoundGraspDetector(GraspDetector):
         # No additional autocast, width adjustment, NMS or candidate truncation.
         with self.torch.no_grad():
             gg = self.impl.detect(
-                rgb, depth_m, K, top_k=50, nms=True,
+                rgb, depth_m, K, top_k=getattr(self, 'top_k', 50),
+                nms=getattr(self, 'final_nms', True),
                 use_collision_detection=self.collision,
                 collision_voxel_size=self.collision_voxel,
                 store_vis=False, use_verifier=self.refiner is not None)

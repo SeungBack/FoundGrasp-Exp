@@ -34,7 +34,8 @@ def test_candidate_with_unreachable_recovery_is_skipped(monkeypatch):
     report = selection.select_grasp(grasps, np.eye(4), cfg, robot)
     assert report.selected.index == 1
     assert any("transfer" in reason for _, reason in report.rejected)
-    upper = [T for T in tested if T[2, 3] > .3]
+    # Interior samples now include partially rotated poses; endpoints are at max z.
+    upper = [T for T in tested if np.isclose(T[2, 3], max(t[2, 3] for t in tested))]
     assert upper
     for T in upper:
         assert any(np.allclose(T[:3, :3], home_R @ np.diag([s, s, 1])) for s in (1, -1))

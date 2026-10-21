@@ -4,6 +4,8 @@
 source "$(dirname "$0")/common.sh"
 ENV="$1"; PY="$(env_py "$ENV")"
 WHEEL_DIR="$BUILD_DIR/wheels"; mkdir -p "$WHEEL_DIR"
+# Wheel names are normalized to lowercase by newer setuptools.
+shopt -s nocaseglob
 conda install -y -n "$ENV" -c anaconda openblas-devel
 conda install -y -n "$ENV" -c conda-forge ninja
 if ! ls "$WHEEL_DIR"/MinkowskiEngine-*.whl >/dev/null 2>&1; then

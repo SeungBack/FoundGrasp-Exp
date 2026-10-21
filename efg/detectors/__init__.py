@@ -33,6 +33,11 @@ def build_detector(cfg):
     """설정(cfg['detector'])으로 백엔드 인스턴스 생성."""
     d = cfg["detector"]
     name = d.get("name", "foundgrasp")
+    protocol = cfg.get('postprocess', {}).get('protocol', 'legacy')
+    if protocol not in ('legacy', 'common'):
+        raise ValueError(f"Unknown postprocess.protocol: {protocol}")
+    if protocol == 'common' and name not in ('foundgrasp', 'anygrasp'):
+        raise ValueError("common protocol currently supports foundgrasp / anygrasp only")
     if name not in REGISTRY:
         raise SystemExit(f"알 수 없는 detector.name '{name}' — "
                          f"사용 가능: {', '.join(available())}")

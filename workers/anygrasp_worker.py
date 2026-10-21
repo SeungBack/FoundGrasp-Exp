@@ -1,21 +1,13 @@
-"""AnyGrasp SDK 워커 — 논문 sim_worker.py 와 같은 형식 (efg/worker_protocol.py).
+"""AnyGrasp SDK worker: RGB-D -> SDK opening-width grasps in camera metres.
 
-입력 프레임 → 카메라 좌표계 점군(depth (0, 1.5m), EconomicGrasp 워커와 같은 범위)
-→ detector.get_grasp(points, dense_grasp=False, collision_detection=True)
-→ (N,17) GraspGroup 배열, width 는 raw 폭으로 환산(÷ --width_divisor).
-
-width 규약: SDK 문서는 width 를 "필요한 개방 폭"이라 설명하고, AnyGrasp 의 전신
-GSNet 계열 decode 는 예측 폭에 x1.2 마진을 곱한다. 공유 실행 계층이 x1.2 를 한 번
-적용하므로 여기서 1.2 로 나눠 다른 방법과 같은 raw 폭으로 맞춘다 (SDK 가 비공개라
-추정 — 마진이 없다고 확인되면 --width_divisor 1.0).
-충돌검사: SDK 내장 CD 를 켠다 (RNGNet·HGGD 내장 CD 와 같은 "방법 고유 CD" 위치).
-
-라이선스는 <sdk_dir>/license_registration/license 를 쓴다 (작업 디렉터리를 그곳으로).
-실행 (efg-anygrasp env):
-  python workers/anygrasp_worker.py --work_dir /tmp/w --sdk_dir ~/Workspaces/anygrasp_sdk \
-      --checkpoint <checkpoint_detection.tar>
+The SDK documents width as required gripper opening. Preserve it exactly;
+never infer a hidden x1.2 margin from a different model's implementation.
+SDK binaries and license remain in their original workspace; a private runtime
+folder provides the layout required by the SDK's loader.
 """
 import argparse
+import importlib.machinery
+import json
 import os
 import sys
 from pathlib import Path
@@ -24,9 +16,55 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from efg.worker_protocol import serve  # noqa: E402
+from efg.worker_protocol import serve
 
-DEPTH_MAX_M = 1.5
+
+def points_from_depth(depth, K, depth_max_m=1.5):
+    depth = np.asarray(depth, dtype=np.float32)
+    K = np.asarray(K, dtype=np.float64)
+    if depth.ndim != 2 or K.shape != (3, 3) or not np.isfinite(K).all():
+        raise ValueError("Invalid depth/K shape or intrinsics")
+    if K[0, 0] <= 0 or K[1, 1] <= 0 or not np.isfinite(depth_max_m) or depth_max_m <= 0:
+        raise ValueError("Focal lengths and depth limit must be positive")
+    v, u = np.nonzero(np.isfinite(depth) & (depth > 0) & (depth < depth_max_m))
+    z = depth[v, u]
+    return np.ascontiguousarray(np.column_stack((
+        (u - K[0, 2]) / K[0, 0] * z,
+        (v - K[1, 2]) / K[1, 1] * z, z)), dtype=np.float32)
+
+
+def predict(detector, depth, K, *, depth_max_m=1.5, nms=True):
+    points = points_from_depth(depth, K, depth_max_m)
+    if not len(points):
+        return np.empty((0, 17), dtype=np.float64)
+    gg = detector.get_grasp(points, {"dense_grasp": False, "collision_detection": True})
+    if gg is None or not len(gg):
+        return np.empty((0, 17), dtype=np.float64)
+    if nms:
+        gg = gg.nms()
+    gg = gg.sort_by_score()
+    # Width is SDK required opening, not a reconstructed object width.
+    return np.asarray(gg.grasp_group_array, dtype=np.float64).copy()
+
+
+def sdk_runtime(sdk_dir, work_dir):
+    sdk = Path(sdk_dir).expanduser().resolve()
+    license_dir = sdk / "license_registration" / "license"
+    if not (license_dir / "licenseCfg.json").is_file():
+        raise RuntimeError(f"AnyGrasp license directory missing: {license_dir}")
+    libraries = [sdk / "grasp_detection" / "gsnet_versions" / ("gsnet" + suffix)
+                 for suffix in importlib.machinery.EXTENSION_SUFFIXES]
+    library = next((p for p in libraries if p.is_file()), None)
+    if library is None:
+        raise RuntimeError(f"AnyGrasp SDK binary for Python {sys.version_info[:2]} missing")
+    runtime = Path(work_dir).resolve() / "sdk_runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    for name, source in (("gsnet.so", library), ("license", license_dir)):
+        target = runtime / name
+        if target.is_symlink() and target.resolve() == source.resolve():
+            continue
+        target.symlink_to(source, target_is_directory=source.is_dir())
+    return runtime
 
 
 def main():
@@ -36,40 +74,41 @@ def main():
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--max_gripper_width", type=float, default=0.1)
     ap.add_argument("--gripper_height", type=float, default=0.03)
-    ap.add_argument("--width_divisor", type=float, default=1.2)
+    ap.add_argument("--depth_max_m", type=float, default=1.5)
+    ap.add_argument("--no-nms", action="store_true", help="Common benchmark: retain SDK candidates")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-
-    sdk = Path(args.sdk_dir).expanduser()
-    if not Path(args.checkpoint).expanduser().exists():
-        raise SystemExit(f"AnyGrasp 체크포인트 없음: {args.checkpoint}")
-    work_dir = os.path.abspath(args.work_dir)
-    sys.path.insert(0, str(sdk / "grasp_detection" / "gsnet_versions"))  # gsnet.cpython-3XX*.so
-    os.chdir(sdk / "license_registration")                               # ./license
-    from easydict import EasyDict
+    checkpoint = Path(args.checkpoint).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise RuntimeError(f"AnyGrasp checkpoint missing: {checkpoint}")
+    if not 0 < args.max_gripper_width <= .1 or not 0 < args.gripper_height < .2:
+        raise ValueError("Invalid gripper dimensions")
+    work_dir = str(Path(args.work_dir).resolve())
+    runtime = sdk_runtime(args.sdk_dir, work_dir)
+    sys.path.insert(0, str(runtime))
+    os.chdir(runtime)
+    import torch
     from gsnet import create_detector
 
-    detector = create_detector(EasyDict(
-        checkpoint_path=str(Path(args.checkpoint).expanduser()),
-        max_gripper_width=args.max_gripper_width, gripper_height=args.gripper_height))
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    detector = create_detector(argparse.Namespace(
+        checkpoint_path=str(checkpoint), max_gripper_width=args.max_gripper_width,
+        gripper_height=args.gripper_height))
     if detector is None:
-        raise SystemExit("AnyGrasp 라이선스 검증 실패 (license_registration/license 확인)")
-    print(f"-> AnyGrasp loaded {args.checkpoint}", flush=True)
+        raise RuntimeError("AnyGrasp license validation failed; see worker log")
+    runtime_info = {'python': sys.version.split()[0], 'torch': torch.__version__,
+                    'cuda': torch.version.cuda, 'gpu': torch.cuda.get_device_name(),
+                    'seed': args.seed, 'nms': not args.no_nms,
+                    'depth_max_m': args.depth_max_m, 'collision_detection': True,
+                    'width_semantics': 'required_opening_m'}
+    (Path(work_dir) / 'runtime.json').write_text(json.dumps(runtime_info, indent=2))
+    print(f"-> AnyGrasp loaded {checkpoint}; width=required_opening_m; nms={not args.no_nms}", flush=True)
 
-    def predict(rgb, depth, K):
-        H, W = depth.shape
-        us, vs = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
-        z = depth.astype(np.float32)
-        mask = (z > 0) & (z < DEPTH_MAX_M)
-        pts = np.stack([(us - K[0, 2]) / K[0, 0] * z, (vs - K[1, 2]) / K[1, 1] * z, z], -1)[mask]
-        gg = detector.get_grasp(pts.astype(np.float32), {
-            "dense_grasp": False, "collision_detection": True})
-        if gg is None or len(gg) == 0:
-            return np.zeros((0, 17))
-        arr = np.asarray(gg.grasp_group_array, dtype=np.float64).copy()
-        arr[:, 1] /= args.width_divisor
-        return arr
+    def infer(rgb, depth, K):
+        return predict(detector, depth, K, depth_max_m=args.depth_max_m, nms=not args.no_nms)
 
-    serve(work_dir, predict)
+    serve(work_dir, infer, poll_interval=.005, synchronize=torch.cuda.synchronize)
 
 
 if __name__ == "__main__":

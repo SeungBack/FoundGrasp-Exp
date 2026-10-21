@@ -160,7 +160,7 @@ RealSense Viewer와 캡처 프로그램은 동시에 실행하지 않는다.
 
 ## 실행 옵션
 
-플래그는 셋뿐이다. 나머지 동작은 전부 설정 파일에서 정한다.
+실행 옵션 외의 동작은 설정 파일에서 정한다.
 
 | | |
 |---|---|
@@ -169,6 +169,7 @@ RealSense Viewer와 캡처 프로그램은 동시에 실행하지 않는다.
 | `--dry-run` | 스캔·검출·선정만, 로봇/그리퍼 미사용 |
 | `--config PATH` | 다른 설정 파일 사용 |
 | `--set KEY=VALUE` | 설정 항목 일시 변경 (반복 가능) |
+| `--grasp-detector NAME` | 검출 모델 선택 (`detector.name` 별칭) |
 
 ```bash
 python run.py --set live.enabled=false                   # 라이브 창 끄기
@@ -224,6 +225,51 @@ python run.py --set payload_check.enabled=true
 꺼진 상태에선 실패 재시도가 동작하지 않으므로 `--auto`와 함께 쓸 때 주의.
 
 ## 비교군(다른 파지 모델) 추가
+
+AnyGrasp는 기존 레지스트리·상주 워커를 사용합니다. SDK 코드는
+`~/Workspaces/anygrasp_sdk`, 가중치는 `ckpts/checkpoint_detection.tar`, 라이선스는
+`license_registration/license`에 둡니다. 원본 SDK를 수정하지 않고 워커 임시 폴더에
+Python 버전에 맞는 바이너리와 라이선스 디렉터리 링크를 만들어 로드합니다.
+
+```bash
+# 최초 설치: foundgrasp 환경과 분리된 efg-anygrasp 환경
+bash envs/setup_anygrasp.sh
+
+# 저장 프레임으로 검사 — 로봇/카메라 연결 없음
+python scripts/run_inference.py --config configs/benchmark.yaml \
+  --grasp-detector anygrasp --npz outputs/live_frame.npz \
+  --warmup 3 --repeat 5 --record-dir outputs/anygrasp_check \
+  --out outputs/anygrasp_check/grasps.npy --vis outputs/anygrasp_check/overlay.jpg
+
+# 동일 설정에서 AI만 교체: 위 명령의 --grasp-detector foundgrasp
+# 실제 실행 (기존 캘리브레이션·모션·그리퍼·재시도 설정 상속)
+python run.py --config configs/benchmark.yaml --grasp-detector anygrasp
+```
+
+`--grasp-detector`는 `detector.name`을 덮어쓰는 별칭이며 `--set detector.name=...`도
+계속 지원합니다. 기본 `configs/default.yaml`의 FoundGrasp 독립 추론 동작은 유지합니다.
+`configs/benchmark.yaml`은 현재 **FoundGrasp / AnyGrasp**용 공통 실행 프로토콜입니다.
+EconomicGrasp/RNGNet은 이 프로토콜의 검증 대상에 아직 포함하지 않습니다.
+
+공통 설정은 같은 입력 ROI·실측 K·폭 한계·공유 충돌 검사(voxel 1cm, 접근 5cm,
+thresh 0.01)·ROI 필터·IK·대칭 선정·모션을 사용합니다. FoundGrasp의 최종 NMS/top-50과
+AnyGrasp 데모의 외부 NMS는 끄고, 각 모델의 내부 후보 생성·refiner/내장 CD는 유지합니다.
+SDK 내부 처리는 비공개이므로 동일한 내부 후보 수를 보장하지 않습니다.
+공통 설정의 AnyGrasp 검사 높이는 기존 FoundGrasp 후보와 같은 20mm로 지정합니다.
+FoundGrasp 최종 폭은 그대로 실행하며, AnyGrasp는 SDK 출력 폭에
+`postprocess.open_multiplier`(기본 1.2)를 곱한 뒤 개방 한계로 제한합니다.
+예: AnyGrasp 60mm → 72mm, 90mm → 100mm(한계). benchmark 설정도 같은 값을 상속합니다.
+AnyGrasp의 숨은 x1.2 마진을 추정해 나누던 코드는 제거했습니다.
+이는 실제 장비의 공통 실행 비교이며, 시뮬레이터의 raw-width × 1.2 규약을 그대로
+재현했다는 의미는 아닙니다. 기존 단독 실행 결과와 공통 프로토콜 결과를 구분해 기록하세요.
+
+`efg/perception.py`는 실제 실행과 저장 프레임 검사에 같은 인식·후처리 경로를 제공합니다.
+`efg/recording.py`는 실제 설정, 코드/가중치/캘리브레이션 해시, 입력 RGB-D/K,
+필터 전후 후보와 단계별 개수·시간을 기록합니다. `output.save_cycles=true`이면
+실행에서도 사이클/재추론별로 같은 산출물을 저장합니다.
+AnyGrasp의 **워커 내부 시간**은 전처리+SDK+디코딩/고유 필터를 CUDA 동기화 후 측정하고,
+**검출 시간**은 파일 통신·폴링까지 포함합니다. 공통 후처리 시간은 별도입니다.
+모델 로딩과 워밍업은 측정에서 제외됩니다. 이송 완료를 실제 파지 성공으로 간주하지 않습니다.
 
 검출 백엔드 하나만 구현하면 ROI·좌표 변환·선정·모션·판정은 그대로 쓰인다.
 
@@ -317,7 +363,13 @@ python -m pytest tests/ -q     # 38건: 변환·선정 기하, 그리퍼 시퀀�
 주변에서 경로를 더 둥글게 통과합니다. 높은 경유점은 `max(선정 상승 높이,
 drop.via_height_m, pre-grasp 높이 + 5 cm)`에 `drop.transfer_clearance_margin_mm`
 (기본 10 mm)만큼 여유를 더합니다. 높은 경유점의 IK·J7도 파지 후보 선정 시
-검사하며, 실행 전 IK·J7을 다시 확인합니다. 릴리즈에서는
+검사하며, 실행 전 IK·J7을 다시 확인합니다. 상승 경로의 중간 자세도 병진 20mm·회전 5°
+중 더 촘촘한 간격으로 검사합니다 (`robot.rise_ik_step_mm`, `rise_ik_step_deg`).
+중간 IK/J7 검사 실패 시 선정 단계에서는 다른 대칭 조합·후보를 검토하고,
+실행 직전 재검사 실패 시에는 이동을 보내지 않습니다. 추가 IK 질의 시간은 선정·상승 준비에 포함됩니다.
+이는 직선 병진·최단 회전 경로의 표본 검사이며, 컨트롤러 블렌딩·관절해 연속성·특이점·충돌을
+보장하는 경로 계획은 아닙니다. 상승 중 오류에는 실제 TCP·관절각·상승 목표와 error/warn을
+분리해 출력합니다. 릴리즈에서는
 정지·큐 비움·관절 목표 오차 0.5° 이하를 확인한 뒤 개방합니다. 명령 거부 시
 다른 경로로 재시도하지 않고 큐를 정지합니다.
 
@@ -413,7 +465,7 @@ place는 기본 `gripper.release_mode: width`입니다. 완전 개방 명령을 
 이 모드와 연결 점검에서는 `gripper.open_min_wait_s`(기본 0.15초)가 적용됩니다.
 `payload_check.enabled: false`이면 토크 측정용 `payload_check.settle_s` 대기는 적용되지 않습니다.
 
-현재 FoundGrasp는 `third_party/FoundGrasp/grasp_detector.py`의 독립 `detect()`를
+기본 설정의 FoundGrasp는 `third_party/FoundGrasp/grasp_detector.py`의 독립 `detect()`를
 직접 호출합니다. 모델 내부 4 mm voxel NMS(최대 4096개), 원본 폭 보정,
 refiner/GPU collision 분기, 최종 grasp NMS(5 cm / 30°), top-50을 그대로 사용합니다.
 원본과 동일하게 forward에 별도 autocast를 추가하지 않습니다. Refiner는 기존
@@ -423,7 +475,9 @@ refiner를 끄면 원본 GPU hard collision 검사가 실행됩니다.
 FoundGrasp에는 추가 공유 충돌 검사와 개방 폭 x1.2를 적용하지 않습니다.
 로봇 실행 시 score<=0 후보와 실제 그리퍼 한계 95 mm 초과 후보를 제외하고,
 ROI·기하·IK 검사를 유지합니다. 따라서 실행 가능한 후보 수는 50보다 적을 수 있습니다.
-비교군은 기존 공유 충돌 검사와 폭 마진을 유지하며,
+AnyGrasp는 공유 충돌 검사를 적용하고 SDK의 개방 폭을 그대로 사용합니다.
+기존 EconomicGrasp/RNGNet/HGGD 워커는 raw 폭에 추가 마진을 적용합니다.
+공유 충돌 검사는
 `postprocess.collision.backend=auto`에서 CUDA가 있으면 GPU `detect_soft()`를 사용합니다.
 
 후보가 없거나 ROI·IK·하강 제한 후 실행 자세가 없으면 같은 홈에서 새 프레임으로

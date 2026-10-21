@@ -136,6 +136,7 @@ def transfer(setup):
     p.cfg["lift_speed_mm_s"] = 700
     p.robot.T_flange_tcp = np.eye(4)
     p.robot.check_flange_ik.return_value = True
+    p.robot.flange_ik_joints_deg.return_value = [0.] * 7
     p.robot.arm.set_servo_angle.return_value = 0
     p.robot.arm.get_servo_angle.return_value = 0, [1.] * 7
     start = np.eye(4)
@@ -374,3 +375,48 @@ def test_changed_upper_ik_branch_blocks_transfer_before_any_move(transfer):
     p.robot.arm.set_position.assert_not_called()
     p.robot.arm.set_servo_angle.assert_not_called()
     p.robot.stop_motion.assert_called_once()
+
+
+def test_midrise_ik_failure_blocks_all_motion_even_with_valid_endpoints(transfer):
+    p = transfer
+    p.robot.flange_ik_joints_deg.side_effect = lambda T: (
+        None if .54 < T[2, 3] < .57 else [0.] * 7)
+    assert not motion.lift_and_transfer_blended(
+        p.robot, p.pre, p.lift, p.cfg, p.drop, j7_limits=[-89, 90])
+    p.robot.arm.set_position.assert_not_called()
+    p.robot.arm.set_servo_angle.assert_not_called()
+    p.robot.arm.clean_error.assert_not_called()
+
+
+def test_c21_rise_captures_pose_before_stop_and_does_not_transfer(transfer, capsys):
+    p = transfer
+    p.robot.arm.get_state.return_value = 0, 4
+    p.robot.arm.get_err_warn_code.return_value = 0, [21, 14]
+
+    def read_pose(**kwargs):
+        p.robot.stop_motion.assert_not_called()
+        return 0, [537., -189., 300., 180., 0., 0.]
+
+    p.robot.arm.get_position.side_effect = read_pose
+    assert not motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    output = capsys.readouterr().out
+    assert 'error=21, warn=14' in output
+    assert '실측 TCP' in output and '실측 관절' in output and '상승 목표' in output
+    p.robot.arm.set_servo_angle.assert_not_called()
+    p.robot.stop_motion.assert_called_once()
+
+
+def test_rise_sampling_includes_rotation_and_correct_flange_offset():
+    robot = Mock()
+    robot.T_flange_tcp = np.eye(4)
+    robot.T_flange_tcp[2, 3] = .223
+    robot.flange_ik_joints_deg.return_value = [0.] * 7
+    start, target = np.eye(4), np.eye(4)
+    target[2, 3] = .02
+    target[:3, :3] = motion.Rotation.from_euler('y', 30, degrees=True).as_matrix()
+    assert motion.rise_path_error(robot, start, target, {}) is None
+    calls = robot.flange_ik_joints_deg.call_args_list
+    assert len(calls) == 5  # 30 degrees / 5, excluding both endpoints
+    middle_tcp = calls[2].args[0] @ robot.T_flange_tcp
+    assert middle_tcp[2, 3] == pytest.approx(.01)
+    assert motion.pose_delta(start, middle_tcp)[1] == pytest.approx(15.)

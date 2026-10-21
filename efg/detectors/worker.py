@@ -3,7 +3,7 @@
 비교군은 서로 다른 의존성(MinkowskiEngine, pytorch3d, AnyGrasp SDK …)이 필요해
 메인 프로세스에 함께 올릴 수 없다. 논문 시뮬 벤치마크와 같은 방식을 쓴다:
   워커 = 논문 레포의 ext/<repo>/sim_worker.py (AnyGrasp는 이 레포 workers/anygrasp_worker.py)
-  프로토콜 = efg/worker_protocol.py (sim/worker_protocol.py 무수정 사본)
+  프로토콜 = efg/worker_protocol.py (기존 파일 규약 + 선택적 시간 메타데이터)
 워커는 build 시 자동으로 띄우고(모델 1회 로드), close/종료 시 내린다.
 
 설정 (detector.<name>):
@@ -14,6 +14,7 @@
   startup_timeout_s / request_timeout_s
 """
 import atexit
+import json
 import os
 import subprocess
 import tempfile
@@ -40,6 +41,11 @@ class WorkerDetector(GraspDetector):
     def __init__(self, cfg, device="cuda", name="worker"):
         super().__init__(cfg, device)
         self.name = name
+        self.last_inference_ms = None
+        self.last_roundtrip_ms = None
+        self.runtime_metadata = None
+        if name == 'anygrasp' and device != 'cuda':
+            raise ValueError("AnyGrasp worker uses device=cuda; select GPU with CUDA_VISIBLE_DEVICES")
         py = resolve(cfg["python"]) if cfg.get("python") else conda_python(cfg["conda_env"])
         script = resolve(cfg["script"])
         for label, p in (("python", py), ("script", script)):
@@ -61,9 +67,17 @@ class WorkerDetector(GraspDetector):
         self.proc = subprocess.Popen(cmd, cwd=str(Path(script).parent), env=env,
                                      stdout=self._log, stderr=subprocess.STDOUT)
         atexit.register(self.close)
-        self._wait_ready(float(cfg.get("startup_timeout_s", 600)))
+        try:
+            self._wait_ready(float(cfg.get("startup_timeout_s", 600)))
+        except BaseException:
+            self.close()
+            raise
+        runtime_path = Path(self.work_dir) / 'runtime.json'
+        if runtime_path.is_file():
+            self.runtime_metadata = json.loads(runtime_path.read_text())
         self.client = WorkerClient(self.work_dir,
-                                   timeout=float(cfg.get("request_timeout_s", 120)))
+                                   timeout=float(cfg.get("request_timeout_s", 120)),
+                                   poll_interval=float(cfg.get("poll_interval_s", .05)))
 
     def _tail(self, n=25):
         try:
@@ -91,17 +105,28 @@ class WorkerDetector(GraspDetector):
         GraspGroup = import_grasp_group()
         if self.proc.poll() is not None:
             raise RuntimeError(f"[{self.name}] 워커 종료됨:\n{self._tail()}")
+        self.last_inference_ms = None
+        self.last_roundtrip_ms = None
+        started = time.perf_counter()
         arr = self.client.request(rgb, depth_m, K)
-        return GraspGroup(arr.reshape(-1, 17))
+        self.last_roundtrip_ms = (time.perf_counter() - started) * 1000
+        if self.client.last_metrics is not None:
+            self.last_inference_ms = self.client.last_metrics['inference_ms']
+        if arr.ndim != 2 or arr.shape[1] != 17:
+            raise RuntimeError(f"[{self.name}] 잘못된 워커 출력: {arr.shape}")
+        return GraspGroup(arr)
 
     def close(self):
         proc = getattr(self, "proc", None)
-        if proc is None or proc.poll() is not None:
+        if proc is None:
             return
         try:
-            open(os.path.join(self.work_dir, "stop"), "w").close()
-            proc.wait(timeout=10)
+            if proc.poll() is None:
+                open(os.path.join(self.work_dir, "stop"), "w").close()
+                proc.wait(timeout=10)
         except Exception:
             proc.kill()
+            proc.wait(timeout=5)
         finally:
             self._log.close()
+            atexit.unregister(self.close)

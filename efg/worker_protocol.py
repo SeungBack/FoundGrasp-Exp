@@ -1,5 +1,5 @@
-# 원본: Workspaces/FoundGrasp/sim/worker_protocol.py (논문 시뮬 벤치마크) — 무수정 사본.
-# 비교군 워커(sim_worker.py)와 같은 파일 프로토콜을 써야 하므로 내용을 바꾸지 말 것.
+# Based on FoundGrasp sim/worker_protocol.py. Array wire format remains compatible;
+# local workers additionally publish optional per-request timing sidecars.
 """baseline 워커 <-> 시뮬 드라이버 파일 기반 프로토콜.
 
 baseline들은 서로 다른 conda env(tta-grasp/hggd/cgnet/GraspSAM)에서 돌아야
@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import glob
+import json
 
 import inspect
 import numpy as np
@@ -43,7 +44,7 @@ def atomic_save_npz(path, **arrays):
     os.replace(tmp + '.npz', path)
 
 
-def serve(work_dir, predict_fn, poll_interval=0.05):
+def serve(work_dir, predict_fn, poll_interval=0.05, synchronize=None):
     """워커 메인 루프. predict_fn(rgb, depth, K) -> (N,17) float64 ndarray.
 
     work_dir의 req_*.npz를 오래된 순으로 처리해 res_*.npy로 응답한다.
@@ -63,15 +64,25 @@ def serve(work_dir, predict_fn, poll_interval=0.05):
         req_path = reqs[0]
         req_id = os.path.basename(req_path)[len('req_'):-len('.npz')]
         try:
-            data = np.load(req_path)
-            rgb, depth, K = data['rgb'], data['depth'], data['K']
-            mask = data['mask'] if 'mask' in data.files else None
-            t0 = time.time()
+            with np.load(req_path) as data:
+                rgb, depth, K = data['rgb'], data['depth'], data['K']
+                mask = data['mask'] if 'mask' in data.files else None
+            if synchronize:
+                synchronize()
+            t0 = time.perf_counter()
             if mask is not None and 'mask' in inspect.signature(predict_fn).parameters:
                 gg = np.asarray(predict_fn(rgb, depth, K, mask=mask), dtype=np.float64)
             else:
                 gg = np.asarray(predict_fn(rgb, depth, K), dtype=np.float64)
+            if synchronize:
+                synchronize()
+            inference_ms = (time.perf_counter() - t0) * 1000
             assert gg.ndim == 2 and gg.shape[1] == 17, f'bad shape {gg.shape}'
+            meta_path = os.path.join(work_dir, f'res_{req_id}.json')
+            with open(meta_path + '.tmp', 'w') as f:
+                json.dump({'version': 1, 'inference_ms': inference_ms,
+                           'gpu_synchronized': synchronize is not None}, f)
+            os.replace(meta_path + '.tmp', meta_path)
             _atomic_save_npy(os.path.join(work_dir, f'res_{req_id}.npy'), gg)
             # 추론 누적 GPU 메모리 방출. MinkowskiEngine(eco/sbg/gnb sparse conv)은
             # 좌표 구조별 kernel-map을 전역 캐시에 쌓아 실제 다양한 클라우드에서
@@ -88,7 +99,7 @@ def serve(work_dir, predict_fn, poll_interval=0.05):
                     torch.cuda.empty_cache()
             except ImportError:
                 pass
-            print(f'[worker] req {req_id}: {len(gg)} grasps in {time.time()-t0:.2f}s', flush=True)
+            print(f'[worker] req {req_id}: {len(gg)} grasps in {inference_ms / 1000:.3f}s', flush=True)
         except Exception:
             import traceback
             err = traceback.format_exc()
@@ -109,9 +120,11 @@ class WorkerClient:
         self.timeout = timeout
         self.poll_interval = poll_interval
         self._next_id = 0
+        self.last_metrics = None
         os.makedirs(work_dir, exist_ok=True)
 
     def request(self, rgb, depth, K, mask=None):
+        self.last_metrics = None
         req_id = f'{self._next_id:06d}'
         self._next_id += 1
         atomic_save_npz(os.path.join(self.work_dir, f'req_{req_id}.npz'),
@@ -120,10 +133,15 @@ class WorkerClient:
                         **({'mask': mask.astype(np.uint8)} if mask is not None else {}))
         res_path = os.path.join(self.work_dir, f'res_{req_id}.npy')
         err_path = os.path.join(self.work_dir, f'err_{req_id}.txt')
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
             if os.path.exists(res_path):
                 arr = np.load(res_path)
+                meta_path = os.path.join(self.work_dir, f'res_{req_id}.json')
+                if os.path.exists(meta_path):
+                    with open(meta_path) as f:
+                        self.last_metrics = json.load(f)
+                    os.remove(meta_path)
                 os.remove(res_path)
                 return arr
             if os.path.exists(err_path):

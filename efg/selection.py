@@ -1,6 +1,6 @@
 """그립 후보 선정 — score 순위대로 기하·로봇 IK 적합성을 검사해 첫 통과 후보 채택.
 
-pre-grasp / grasp / transfer 경유 자세가 모두 IK 가능해야 채택한다.
+pre-grasp / grasp / transfer 경유 자세와 상승 중간 표본이 IK 가능해야 채택한다.
 파지·상승 각각의 180° 등가 방향을 조합해 관절 이동 비용이 작은 경로를 고른다.
 
 공정성: score는 순위로만 쓴다. 방법마다 score 분포가 달라 절대값 기준(최소 score,
@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .motion import transfer_waypoint
+from .motion import transfer_waypoint, rise_path_error
 from .console import detail
 from .transforms import (approach_tilt_deg, grasp_to_base, lifted,
                          offset_along_tool_z, tool_pose_from_grasp)
@@ -181,7 +181,21 @@ def select_grasp(gg, T_base_cam, cfg, robot=None):
         if not feasible:
             continue
         feasible.sort(key=lambda f: (*f[4], -(f[5] if f[5] is not None else 0.)))
-        sign, T_grasp, T_pre, T_lift, cost, _, transfer_sign = feasible[0]
+        chosen = None
+        for option in feasible:
+            sign, T_grasp, T_pre, T_lift, cost, _, transfer_sign = option
+            if use_ik:
+                target, _ = transfer_waypoint(T_pre, T_lift, cfg['drop'], robot.R_home_tcp,
+                                              closing_sign=transfer_sign)
+                reason = rise_path_error(robot, T_pre, target, cfg['robot'], (j7_lo, j7_hi))
+                if reason:
+                    report.rejected.append((i, f"{reason} (sign={sign:+d}, transfer={transfer_sign:+d})"))
+                    continue
+            chosen = option
+            break
+        if chosen is None:
+            continue
+        sign, T_grasp, T_pre, T_lift, cost, _, transfer_sign = chosen
         if use_ik:
             detail(f"대칭 선택: 파지 {sign:+d} · 상승 {transfer_sign:+d} · "
                    f"경로 관절비용 {cost[0]:.1f}° / 총 이동 {cost[1]:.1f}° "

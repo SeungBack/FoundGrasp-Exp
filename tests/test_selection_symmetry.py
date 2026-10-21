@@ -140,3 +140,23 @@ def test_dry_run_does_not_claim_joint_optimized_upper(scene):
     s = selection.select_grasp([SimpleNamespace(score=1., width=.06, depth=0.)],
                                np.eye(4), scene.cfg).selected
     assert s.transfer_sign == 1
+
+
+def test_endpoint_feasible_but_midrise_impossible_is_rejected(scene):
+    p = scene
+    original = p.robot.flange_ik_joints_deg
+    p.robot.flange_ik_joints_deg = lambda T: (
+        None if .25 < T[2, 3] < .30 else original(T))
+    report = p.select()
+    assert report.selected is None
+    assert any('상승 경로' in why for _, why in report.rejected)
+
+
+def test_midrise_j7_limit_is_enforced(scene):
+    p = scene
+    original = p.robot.flange_ik_joints_deg
+    p.robot.flange_ik_joints_deg = lambda T: (
+        [0.] * 6 + [100.] if .25 < T[2, 3] < .30 else original(T))
+    report = p.select()
+    assert report.selected is None
+    assert any('상승 경로' in why and 'J7' in why for _, why in report.rejected)

@@ -12,12 +12,15 @@ from efg import postprocess
 
 
 @pytest.mark.parametrize("with_refiner", [False, True])
-def test_delegates_nms_topk_and_collision_to_original(with_refiner):
+@pytest.mark.parametrize("common", [False, True])
+def test_delegates_nms_topk_and_collision_to_original(with_refiner, common):
     detector = FoundGraspDetector.__new__(FoundGraspDetector)
     detector.torch = SimpleNamespace(no_grad=nullcontext)
     detector.refiner = object() if with_refiner else None
     detector.collision = True
     detector.collision_voxel = .01
+    detector.top_k = 0 if common else 50
+    detector.final_nms = not common
     detector.impl = SimpleNamespace(last_verifier_ms=999)
     expected = object()
 
@@ -29,7 +32,7 @@ def test_delegates_nms_topk_and_collision_to_original(with_refiner):
     detector.impl.detect = Mock(side_effect=detect)
     assert detector.detect("rgb", "depth", "K") is expected
     detector.impl.detect.assert_called_once_with(
-        "rgb", "depth", "K", top_k=50, nms=True,
+        "rgb", "depth", "K", top_k=0 if common else 50, nms=not common,
         use_collision_detection=True, collision_voxel_size=.01,
         store_vis=False, use_verifier=with_refiner)
     assert detector.last_refiner_ms == (7 if with_refiner else None)

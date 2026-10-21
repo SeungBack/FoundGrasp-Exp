@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from efg import demo
+from efg import demo, perception
 from efg.camera import CameraError
 
 
@@ -273,8 +273,14 @@ def test_run_cleans_up_camera_failure_without_exit_home(
         "postprocess": {"roi_depth_mask": False},
     }
     grasp = SimpleNamespace(translation=np.array([0.0, 0.0, 1.0]))
-    grasps = [grasp]
-    detector = Mock(last_refiner_ms=None)
+    from efg.paths import import_grasp_group
+    rows = np.zeros((1, 17))
+    rows[:, 0] = 1.
+    rows[:, 1:4] = [.04, .02, .02]
+    rows[:, 4:13] = np.eye(3).reshape(9)
+    rows[:, 15] = 1.
+    grasps = import_grasp_group()(rows)
+    detector = Mock(last_refiner_ms=None, last_inference_ms=None)
     detector.detect.return_value = grasps
     detector.detect.side_effect = lambda *a: advance(1.) or grasps
     detector.describe.return_value = "fake detector"
@@ -296,9 +302,9 @@ def test_run_cleans_up_camera_failure_without_exit_home(
     monkeypatch.setattr(demo, "go_home", home)
     monkeypatch.setattr(demo.time, "sleep", Mock())
     monkeypatch.setattr(demo, "resolve_intrinsics", lambda K, cfg: K)
-    monkeypatch.setattr(demo, "shared_filter", Mock(return_value=(
+    monkeypatch.setattr(perception, "shared_filter", Mock(return_value=(
         grasps, {"detected": 1, "width_ok": 1, "collision_free": 1})))
-    monkeypatch.setattr(demo, "filter_roi", lambda gg, *args: gg)
+    monkeypatch.setattr(perception, "filter_roi", lambda gg, *args: gg)
     monkeypatch.setattr(demo, "exclude_near", lambda gg, *args: gg)
     monkeypatch.setattr(demo, "select_grasp", Mock(return_value=SimpleNamespace(
         selected=p.selected, rejected=[])))
@@ -319,7 +325,7 @@ def test_run_cleans_up_camera_failure_without_exit_home(
             count[0] += 1
             pool = [] if retry_mode == "exhausted" or count[0] <= 2 else grasps
             return pool, {"detected": len(pool), "width_ok": len(pool), "collision_free": len(pool)}
-        monkeypatch.setattr(demo, "shared_filter", filter_retry)
+        monkeypatch.setattr(perception, "shared_filter", filter_retry)
     if retry_mode == "selection":
         rejected = SimpleNamespace(selected=None, rejected=[(0, "IK")], summary=lambda: "IK")
         monkeypatch.setattr(demo, "select_grasp", Mock(side_effect=[

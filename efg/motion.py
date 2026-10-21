@@ -2,6 +2,7 @@
 import time
 
 import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
 
 from .robot import XArm7
 from .console import detail
@@ -142,6 +143,52 @@ def reorientation_speed(T_start, T_end, cfg):
     return speed, angle
 
 
+def rise_path_error(robot, start, target, cfg, j7_limits=None, check=None):
+    """Sample nominal straight rise + shortest rotation; return rejection reason.
+
+    Feasibility screening only: SDK endpoint IK cannot certify the controller's
+    blended trajectory, branch continuity, singularities or swept collisions.
+    In particular, firmware 2.7.1 ignores the SDK's ref_angles parameter.
+    """
+    step_mm = float(cfg.get("rise_ik_step_mm", 20))
+    step_deg = float(cfg.get("rise_ik_step_deg", 5))
+    if not np.isfinite([step_mm, step_deg]).all() or min(step_mm, step_deg) <= 0:
+        raise ValueError("상승 IK 검사 간격은 유한한 양수여야 합니다")
+    distance, angle = pose_delta(start, target)
+    count = max(2, int(np.ceil(max(distance * 1000 / step_mm, angle / step_deg))))
+    rotations = Slerp([0., 1.], Rotation.from_matrix(np.stack(
+        [start[:3, :3], target[:3, :3]])))
+    for i in range(1, count):
+        if check:
+            check()
+        fraction = i / count
+        T = np.eye(4)
+        T[:3, 3] = start[:3, 3] * (1 - fraction) + target[:3, 3] * fraction
+        T[:3, :3] = rotations(fraction).as_matrix()
+        q = robot.flange_ik_joints_deg(T @ inv_se3(robot.T_flange_tcp))
+        location = f"상승 경로 {fraction:.0%}, z={T[2, 3] * 1000:.1f}mm"
+        if q is None or np.shape(q) != (7,) or not np.isfinite(q).all():
+            return f"IK 불가 ({location})"
+        if j7_limits is not None and not j7_limits[0] <= q[6] <= j7_limits[1]:
+            return f"J7 {q[6]:.1f}° 제한 초과 ({location})"
+    return None
+
+
+def _rise_diagnostics(robot, target):
+    """Best-effort read-only snapshot before our stop request obscures state."""
+    for label, read in (
+        ("실측 TCP mm/deg", lambda: robot.arm.get_position(is_radian=False)),
+        ("실측 관절 deg", lambda: robot.arm.get_servo_angle(is_radian=False)),
+    ):
+        try:
+            print(f"  상승 중단 {label}: {read()}")
+        except Exception as exc:
+            print(f"  상승 중단 {label} 조회 실패: {exc}")
+    pose = np.asarray(se3_to_xarm_pose(target))
+    pose[3:] = np.degrees(pose[3:])
+    print(f"  상승 목표 TCP mm/deg: {np.round(pose, 3).tolist()}")
+
+
 def wait_tcp_stopped(robot, target, timeout_s, check=None, confirm_s=.2):
     """Barrier between Cartesian and joint motion: no later command is queued."""
     confirm_s = _confirm_time({"confirm_s": confirm_s}, "confirm_s")
@@ -154,8 +201,9 @@ def wait_tcp_stopped(robot, target, timeout_s, check=None, confirm_s=.2):
         err_code, errors = robot.arm.get_err_warn_code()
         queue_code, pending = robot.arm.get_cmdnum()
         if code or err_code or queue_code or errors[0] or state >= 3:
+            _rise_diagnostics(robot, target)
             raise RuntimeError(f"상승 정지 확인 실패 — 조인트 이송 미전송 "
-                               f"(state={state}, error={errors}, pending={pending})")
+                               f"(state={state}, error={errors[0]}, warn={errors[1]}, pending={pending})")
         actual, _ = robot.get_tcp_pose()
         distance, angle = pose_delta(actual, target)
         if state == 2 and pending == 0 and distance <= .002 and angle <= 1:
@@ -167,6 +215,7 @@ def wait_tcp_stopped(robot, target, timeout_s, check=None, confirm_s=.2):
         else:
             settled_since = None
         time.sleep(.02)
+    _rise_diagnostics(robot, target)
     raise RuntimeError("상승 정지/목표 도착 확인 시간 초과 — 조인트 이송 미전송")
 
 
@@ -206,6 +255,9 @@ def lift_and_transfer_blended(robot, T_pre, T_lift, robot_cfg, drop_cfg, check=N
                 if (angles is None or len(angles) != 7 or not np.isfinite(angles).all()
                         or not j7_limits[0] <= angles[6] <= j7_limits[1]):
                     raise RuntimeError("상승 경유점 J7 제한/IK 재검사 실패")
+        path_error = rise_path_error(robot, T_pre, target, robot_cfg, j7_limits, check)
+        if path_error:
+            raise RuntimeError(path_error)
         joints = np.asarray(drop_cfg["joints_deg"], dtype=float)
         if joints.shape != (7,) or not np.isfinite(joints).all():
             raise RuntimeError("잘못된 릴리즈 관절 목표")

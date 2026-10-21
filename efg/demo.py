@@ -8,8 +8,8 @@
   ROI 내 후보 0개 → 대기, 사용자 입력(Enter 재개 / q 종료).
   제어된 종료(Ctrl+C 1회·q·취소) 시 홈 복귀. 이동 실패 abort는 그 자리 정지.
 
-FoundGrasp는 독립 detect() 경로를 사용한다. 입력 ROI·선정·모션은 공유하되
-추가 공유 충돌 검사와 폭 마진은 비교군에만 적용한다 (efg/postprocess.py).
+입력·검출·공유 필터는 perception.detect_frame으로 오프라인 검사와 공유한다.
+기본 운용은 기존 FoundGrasp 독립 경로, 공통 비교 설정은 configs/benchmark.yaml.
 """
 import select
 import signal
@@ -28,8 +28,10 @@ from .detectors import build_detector
 from .floor import FloorMap, clamp_to_floor
 from .motion import connect_robot, go_home, move_tcp, approach_blended, lift_and_transfer_blended, transfer_waypoint
 from .payload import load_payload_check
-from .postprocess import mask_depth_to_roi, shared_filter, uses_standalone_foundgrasp
-from .roi import draw_overlay, exclude_near, filter_roi, project_px
+from .perception import detect_frame
+from .postprocess import mask_depth_to_roi, uses_standalone_foundgrasp
+from .recording import write_manifest, save_detection
+from .roi import draw_overlay, exclude_near, project_px
 from .se3 import inv_se3, pose_delta
 from .selection import select_grasp
 from .transforms import load_hand_eye
@@ -371,6 +373,8 @@ def _run(cfg, auto=True, dry_run=False):
         with console.model_output(outdir / "model_init.log"):
             detector = build_detector(cfg)
         console.row("검출기", detector.describe())
+        if save_cycles:
+            write_manifest(cfg, outdir / 'manifest.json', detector=detector)
         console.row("모델 로그", str(outdir / "model_init.log"))
         viz.log_text(f"방법: {detector.describe()}  설정: {cfg['_config_path']}")
         warmup_runs = int(get(cfg, "detector.warmup_runs", 1))
@@ -431,20 +435,18 @@ def _run(cfg, auto=True, dry_run=False):
             # 입력: ROI 밖 depth 무효화(0) — 전 방법 동일. 전체 프레임 추론 시 후보가
             # ROI 밖(릴리즈 박스 더미)에 몰려 ROI 내 후보가 0개가 되는 것을 방지.
             # 무효 depth는 센서에서 늘 생기는 정상 입력이라 인공 표면을 만들지 않는다.
-            depth_in = mask_depth_to_roi(depth_m, roi) if mask_roi else depth_m
             cycle_timing.mark("추론·선정·시각화")
             viz.log_stage("Detecting / selecting")
-            t0 = time.perf_counter()
-            gg = detector.detect(rgb, depth_in, K)
-            detect_ms = (time.perf_counter() - t0) * 1000.0
-            # 실행 후처리: 폭 한계 → 비교군만 공유 충돌필터 → 정렬
-            post_t0 = time.perf_counter()
-            gg, counts = shared_filter(gg, depth_m, K, cfg)
-            gg_roi = filter_roi(gg, K, roi)
-            post_ms = (time.perf_counter() - post_t0) * 1000.0
-            counts["roi"] = len(gg_roi)
+            detection = detect_frame(detector, rgb, depth_m, K, cfg, roi)
+            gg_roi, counts = detection.grasps, detection.counts
+            detect_ms, post_ms = detection.detect_ms, detection.post_ms
+            if save_cycles:
+                save_detection(outdir / f'cycle{n:03d}_attempt{inference_retry:02d}',
+                               rgb, depth_m, K, detection)
             extra = getattr(detector, "last_refiner_ms", None)
-            console.row("검출", f"{detect_ms + post_ms:.0f} ms  |  추론 {detect_ms:.0f} ms"
+            model_time = (f"추론 {detect_ms:.0f} ms" if detection.inference_ms is None else
+                          f"워커 {detection.inference_ms:.0f} ms · 통신 포함 {detect_ms:.0f} ms")
+            console.row("검출", f"{detect_ms + post_ms:.0f} ms  |  {model_time}"
                         + (f" (refiner {extra:.0f} ms 포함)" if extra is not None else "")
                         + f" · 후처리 {post_ms:.0f} ms")
             candidates = (f"{counts['detected']} → score {counts.get('score_ok', counts['detected'])}"
