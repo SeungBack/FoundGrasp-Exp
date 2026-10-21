@@ -1,9 +1,0 @@
-__base__: './dav2b.yaml'
-
-# Table IV Row 3 — Frozen backbone, no adapter  [FATAL 1]
-# Required to isolate the freezing effect from the GeoFormer adapter effect.
-# C1 causal hinge: compare Row 3 vs Row 1 (freezing gain alone).
-
-model:
-  peft:
-    type: 'none'

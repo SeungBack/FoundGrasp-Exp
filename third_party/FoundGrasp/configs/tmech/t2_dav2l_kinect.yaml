@@ -1,7 +1,0 @@
-__base__: './t1_dav2l.yaml'
-
-# Table II — FoundGrasp DAv2-Large (Kinect)
-# Same model as t1_dav2l; trained and evaluated on Kinect sensor data.
-
-dataset:
-  camera: 'kinect'

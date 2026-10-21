@@ -23,7 +23,7 @@ def vertical_sel(tip_z):
     T = np.eye(4)
     T[:3, 0], T[:3, 1], T[:3, 2] = [-1, 0, 0], [0, 1, 0], [0, 0, -1]
     T[:3, 3] = [0.2, 0.0, tip_z]
-    return SelectedGrasp(0, 0.9, 0.04, 1, T, offset_along_tool_z(T, 0.1),
+    return SelectedGrasp(0, 0.9, 0.04, 0.048, 1, T, offset_along_tool_z(T, 0.1),
                          lifted(T, 0.15), T[:3, 3].copy())
 
 
@@ -51,7 +51,7 @@ def test_exceeding_budget_rejects():
 def test_finger_tip_checked_not_only_tcp():
     """개폐 방향(base y) 한쪽 핑거 아래만 높은 벽 → 핑거 끝 기준으로 후퇴."""
     fm = flat_map(0.0)
-    half = 0.04 / 2 + 0.005
+    half = 0.048 / 2 + 0.005  # 실행 개방 폭(open_width_m) 기준 핑거 끝
     i = np.round((0.0 + half - fm.y0) / fm.cell).astype(int)  # +y 핑거 끝 셀
     fm.z[i, :] = 0.03
     sel, back = clamp_to_floor(vertical_sel(0.0), G(), fm, CFG)

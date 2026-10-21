@@ -1,7 +1,0 @@
-__base__: './dav2b.yaml'
-
-# Table IV Row 5 — Frozen + AdaptFormer
-
-model:
-  peft:
-    type: 'adaptformer'

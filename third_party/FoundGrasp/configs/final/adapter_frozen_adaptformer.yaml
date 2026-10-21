@@ -1,7 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Table IV — Frozen + AdaptFormer.
-
-model:
-  peft:
-    type: 'adaptformer'

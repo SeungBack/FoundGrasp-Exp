@@ -1,0 +1,17 @@
+__base__: '../ours_base.yaml'
+
+# Table VI — Input-level fusion: xyz enters through a zero-initialized patch-embed
+# extension only (frozen backbone, no adapter, no head depth fusion). Completes the
+# geometry-entry sweep {input / backbone / head}; cf. GeoNVS input-level injection.
+
+model:
+  backbone:
+    xyz_patch_embed: true
+  peft:
+    type: 'none'
+  grasp_head:
+    rgbd_fusion_type: 'none'
+
+inference:
+  palm_clearance: 0.010   # 축방향 손바닥 여유: 중심 -approach 10mm + depth +10mm (손끝 보존)
+  width_clip: 0.1         # CD 전 평가자 규약 [0,0.1] clip

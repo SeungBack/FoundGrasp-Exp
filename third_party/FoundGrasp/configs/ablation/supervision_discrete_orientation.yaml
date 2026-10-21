@@ -1,0 +1,26 @@
+__base__: '../ours_base.yaml'
+
+# Table VII: replace continuous per-pixel orientation regression with a
+# GraspNet-style joint 300-view x 12-angle classification head.
+
+model:
+  grasp_head:
+    name: DiscreteJointOrientationGraspHead
+    num_views: 300
+    num_angles: 12
+    use_kappa: false
+
+training:
+  loss_functions:
+    prediction_aware_assignment: false
+    orientation:
+      type: cross_entropy
+      weight: 6.0
+      normalize_by_log_classes: true
+      max_samples: 65536
+      chunk_size: 4096
+      symmetric_gripper: true
+
+inference:
+  palm_clearance: 0.010   # 축방향 손바닥 여유: 중심 -approach 10mm + depth +10mm (손끝 보존)
+  width_clip: 0.1         # CD 전 평가자 규약 [0,0.1] clip

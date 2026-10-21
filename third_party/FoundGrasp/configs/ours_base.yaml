@@ -1,0 +1,53 @@
+__base__: './_base.yaml'
+
+# ============================================================================
+# [PAPER-FINAL] Ours(FoundGrasp) 최종 레시피 — 모든 최종/게이트 config의 앵커.
+# Table I — DAv2-B, RealSense.
+#
+# _base.yaml 대비 변경점 (전부 이 파일에 명시; configs/final/* 비의존):
+#  1) RC-GT: realized-consistent grasp-depth supervision
+#     (pixelwise_grasp_gt_top300_rc; scripts/gen_pixelwise_gt_rc.py, 두 카메라 동일 절차)
+#  2) kappa 비사용 (head 및 inference reranking)
+#
+# 게이트(2026-07-20, 100ep 2x2)로 확정된 사항:
+#  - propagation/confidence_weighting은 _base 기본값(true) 유지.
+#    off 시 Kinect에서 -1.3 mean AP (53.34 vs ~54.7; 페어드 73.92 vs 75.73 —
+#    annealing 이점을 갖고도 열세). RS는 무해했으나 K 손실이 결정적.
+#  - depth aug(공간상관 axial)는 채택 안 함: K -1.30 / RS -0.21 mean AP.
+#    (게이트 config는 configs/new/*aug100 참조 — 논문 supplementary ablation 재료)
+# ============================================================================
+
+dataset:
+  pixelwise_gt_dir: 'pixelwise_grasp_gt_top300_rc'
+
+model:
+  backbone:
+    name: depth-anything/Depth-Anything-V2-Base-hf
+    freeze: true
+  peft:
+    type: 'geoformer'
+    bottleneck: 96
+    drop_path: 0.2
+    use_ln: false
+    detach_depth: false
+    scale: 1.0
+  grasp_head:
+    use_kappa: false
+
+training:
+  loss_functions:
+    propagate_gt: true
+    confidence_weighting: true
+    prediction_aware_assignment: true
+    approach:
+      type: acosine_similarity
+      weight: 3.0
+    gripper:
+      type: symmetric_acosine_similarity
+      weight: 3.0
+
+inference:
+  palm_clearance: 0.010   # 축방향 손바닥 여유: 중심 -approach 10mm + depth +10mm (손끝 보존)
+  width_clip: 0.1         # CD 전 평가자 규약 [0,0.1] clip
+  approach_kappa_risk_weight: 0.0
+  gripper_kappa_risk_weight: 0.0

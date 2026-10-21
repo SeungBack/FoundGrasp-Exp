@@ -1,7 +1,0 @@
-__base__: './adapter_ft_geoformer.yaml'
-
-# Table IV — Full fine-tuning + GeoFormer, with layer-wise LR decay (LLRD 0.90).
-# Near-uniform FT (aggressive backbone update); upper bound of the sweep.
-
-training:
-  layer_decay_rate: 0.90

@@ -8,6 +8,10 @@ __pycache__/
 third_party/FoundGrasp/logs/
 third_party/**/*.pth
 third_party/**/*.pt
+checkpoints/
+*.core
+core
+core.*
 
 # 편집기·개인 설정
 .vscode/

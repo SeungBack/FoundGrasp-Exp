@@ -1,0 +1,5 @@
+__base__: './ours_base_sr.yaml'
+
+# Kinect counterpart of ours_base_sr.yaml (camera only).
+dataset:
+  camera: 'kinect'

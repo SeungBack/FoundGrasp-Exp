@@ -1,0 +1,5 @@
+Source : https://github.com/google-deepmind/mujoco_menagerie/tree/main/ufactory_xarm7
+Commit : f054586a8e90465d49ee5be15335c4a0c7f57caf
+License: BSD-3-Clause (UFACTORY), see LICENSE
+Files  : xarm7_nohand.xml + its 9 visual meshes, unmodified.
+Use    : rerun visualization only (efg/robot_model.py reads the kinematic chain and meshes).

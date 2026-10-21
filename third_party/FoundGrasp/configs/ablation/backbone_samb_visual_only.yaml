@@ -1,0 +1,19 @@
+__base__: '../ours_base.yaml'
+
+# Discussion (GraspSAM comparison chain): frozen SAM-B, RGB only.
+# Isolates the formulation effect — same prior and same RGB-only input as
+# GraspSAM-vit_b, differing only in 2D-rect vs dense 6-DoF prediction;
+# the step to backbone_samb (full geometry) then isolates the geometry effect.
+
+model:
+  backbone:
+    name: facebook/sam-vit-base
+    freeze: true
+  peft:
+    type: 'none'
+  grasp_head:
+    rgbd_fusion_type: 'none'
+
+inference:
+  palm_clearance: 0.010   # 축방향 손바닥 여유: 중심 -approach 10mm + depth +10mm (손끝 보존)
+  width_clip: 0.1         # CD 전 평가자 규약 [0,0.1] clip

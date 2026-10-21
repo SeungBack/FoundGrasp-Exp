@@ -125,13 +125,18 @@ class ModelFreeCollisionDetectorGPU():
 
     def detect(self, gg_array, approach_dist=0.05,
                min_inner_points=10, finger_length=0.04, finger_width=0.01,
-               height=0.02):
+               height=0.02, depth_base=0.02, eval_aligned=True):
         """HGGD-style hard binary collision detection.
 
         A grasp is kept only when ALL three hold:
           1. inner region (between fingers) has > min_inner_points
           2. finger regions have 0 points
-          3. combined bottom+approach corridor has 0 points
+          3. bottom(+approach) region has 0 points
+
+        eval_aligned=True면 x창을 graspnetAPI 평가자(eval_utils.collision_detection)와
+        동일하게 잡는다: 손가락 (-depth_base, depth), 뒷판 (-(depth_base+finger_width),
+        -depth_base]. 기존 규약은 두 창이 depth를 따라 움직여 depth≈depth_base에서만
+        평가자와 일치했고, 얕은 grasp에서 뒷판 관통을 "손가락 사이 물체"로 오판했다.
 
         Returns:
             no_collision_mask: np.ndarray (N,) bool, True = keep
@@ -151,13 +156,17 @@ class ModelFreeCollisionDetectorGPU():
 
         half_w = widths / 2
         mask1 = (tz > -height / 2) & (tz < height / 2)
-        mask2 = (tx > depths - finger_length) & (tx < depths)
         mask3 = (ty > -(half_w + finger_width))
         mask4 = (ty < -half_w)
         mask5 = (ty < (half_w + finger_width))
         mask6 = (ty > half_w)
-        # combined bottom+approach: x in (depth - fl - fw - approach_dist, depth - fl]
-        mask7 = (tx <= depths - finger_length) & (tx > depths - finger_length - finger_width - approach_dist)
+        if eval_aligned:
+            mask2 = (tx > -depth_base) & (tx < depths)
+            mask7 = (tx > -(depth_base + finger_width)) & (tx <= -depth_base)
+        else:
+            mask2 = (tx > depths - finger_length) & (tx < depths)
+            # combined bottom+approach: x in (depth - fl - fw - approach_dist, depth - fl]
+            mask7 = (tx <= depths - finger_length) & (tx > depths - finger_length - finger_width - approach_dist)
 
         depth_mask   = mask1 & mask2
         left_mask    = depth_mask & mask3 & mask4

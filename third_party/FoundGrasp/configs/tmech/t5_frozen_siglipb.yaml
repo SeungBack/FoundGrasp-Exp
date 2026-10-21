@@ -1,9 +1,0 @@
-__base__: './siglipb.yaml'
-
-# Table V — SigLIP-B, Frozen + GeoFormer
-
-model:
-  peft:
-    type: 'geoformer'
-    detach_depth: false
-    scale: 1.0

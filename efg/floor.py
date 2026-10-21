@@ -54,7 +54,7 @@ def clamp_to_floor(sel, g, fmap, cfg):
     budget = insertion - min_ins  # 뒤로 물릴 수 있는 최대 거리
 
     sel = copy.deepcopy(sel)
-    half = float(g.width) / 2.0 + 0.005
+    half = float(getattr(sel, "open_width_m", g.width)) / 2.0 + 0.005  # 실행 개방 폭 기준 핑거 위치
     total_back = 0.0
     for _ in range(5):  # 후퇴 시 xy도 변해 표면 z가 달라질 수 있어 반복 수렴
         T = sel.T_tcp_grasp

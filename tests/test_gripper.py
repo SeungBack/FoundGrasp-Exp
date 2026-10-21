@@ -135,6 +135,19 @@ def make_ctl(monkeypatch, cfg=None, **fake_kwargs):
     return ctl, fake
 
 
+@pytest.mark.parametrize("invert,expected", [(False, .025), (True, .075)])
+def test_visual_feedback_uses_existing_reads_only(monkeypatch, invert, expected):
+    cfg = {"gripper": {**CFG["gripper"], "invert": invert}}
+    ctl, fake = make_ctl(monkeypatch, cfg=cfg, pos=250)
+    assert ctl.visual_status is None
+    ctl.status()
+    width, stamp = ctl.visual_status
+    assert width == pytest.approx(expected)
+    assert stamp <= time.monotonic()
+    monkeypatch.setattr(fake, "read_status", lambda: pytest.fail("unexpected Modbus I/O"))
+    assert ctl.visual_status == (width, stamp)
+
+
 def test_connect_verifies_open(monkeypatch):
     ctl, fake = make_ctl(monkeypatch, pos=0)  # 닫힘에서 시작
     ctl.connect()
@@ -168,6 +181,63 @@ def test_grip_success_and_empty(monkeypatch):
     fake.target = fake.pos = 1000
     ok, pos = ctl.grip()
     assert not ok and pos == 0.0
+
+
+def test_close_minimum_wait_is_configurable(monkeypatch):
+    cfg = {"gripper": {**CFG["gripper"], "close_min_wait_s": .25}}
+    ctl, fake = make_ctl(monkeypatch, cfg=cfg)
+    monkeypatch.setattr(ctl, "_move_cmd", lambda *a: True)
+    waits = []
+
+    def settle(**kwargs):
+        waits.append(kwargs["min_wait_s"])
+        return True, FakeStatus(300)
+
+    monkeypatch.setattr(ctl, "_wait_settle", settle)
+    assert ctl.grip() == (True, 30.)
+    assert waits == [.25]
+
+
+def test_unsettled_close_cannot_be_treated_as_success(monkeypatch):
+    ctl, _ = make_ctl(monkeypatch)
+    monkeypatch.setattr(ctl, "_move_cmd", lambda *a: True)
+    monkeypatch.setattr(ctl, "_wait_settle", lambda **kw: (False, FakeStatus(300)))
+    with pytest.raises(RuntimeError, match="안정화 실패"):
+        ctl.grip()
+
+
+@pytest.mark.parametrize("position,settled,expected", [
+    (1000, True, True), (500, True, False), (1000, False, False),
+])
+def test_short_open_wait_still_requires_arrival_and_settle(
+        monkeypatch, position, settled, expected):
+    ctl, _ = make_ctl(monkeypatch)
+    monkeypatch.setattr(ctl, "_move_cmd", lambda *a: True)
+
+    def settle(**kwargs):
+        assert kwargs == {"jam_protect": True, "min_wait_s": .15}
+        return settled, FakeStatus(position)
+
+    monkeypatch.setattr(ctl, "_wait_settle", settle)
+    assert ctl.open() is expected
+
+
+@pytest.mark.parametrize("value", [-1, 0, .1, 11, float("nan")])
+def test_invalid_open_wait_rejected(monkeypatch, value):
+    cfg = {"gripper": {**CFG["gripper"], "open_min_wait_s": value}}
+    with pytest.raises(ValueError, match="open_min_wait_s"):
+        make_ctl(monkeypatch, cfg=cfg)
+
+
+def test_minimum_wait_does_not_bypass_position_stability(monkeypatch):
+    ctl, _ = make_ctl(monkeypatch)
+    clock = [0.]
+    monkeypatch.setattr(gctl.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(gctl.time, "sleep", lambda dt: clock.__setitem__(0, clock[0] + dt))
+    monkeypatch.setattr(ctl, "_read_status", lambda: FakeStatus(
+        int(1000 - min(clock[0], .6) * 1000)))
+    ok, _ = ctl._wait_settle(min_wait_s=.3)
+    assert ok and clock[0] >= .75
 
 
 def test_connect_waits_for_running_init(monkeypatch):

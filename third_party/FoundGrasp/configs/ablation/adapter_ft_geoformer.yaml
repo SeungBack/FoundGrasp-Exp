@@ -1,0 +1,17 @@
+__base__: '../ours_base.yaml'
+
+# Table IV — Full fine-tuning + GeoFormer (= Ours but with the backbone unfrozen).
+# LLRD 0.65가 FT의 기본 세팅: head/adapter는 base LR(2e-4, frozen과 동일) 유지,
+# backbone LR은 layer-wise decay 0.65 (ViT-B 관행) — "FT 베이스라인 LR이 불공정"
+# 리뷰 우려를 기본값으로 해소. (llrd 스윕 075/090은 구 final/ 참조)
+
+model:
+  backbone:
+    freeze: false
+
+training:
+  layer_decay_rate: 0.65
+
+inference:
+  palm_clearance: 0.010   # 축방향 손바닥 여유: 중심 -approach 10mm + depth +10mm (손끝 보존)
+  width_clip: 0.1         # CD 전 평가자 규약 [0,0.1] clip

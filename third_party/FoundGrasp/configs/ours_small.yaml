@@ -1,0 +1,14 @@
+__base__: './ours_base.yaml'
+
+# [PAPER-FINAL] Table I — Ours DAv2-S (RealSense). backbone 스케일/adapter 폭만 변경.
+model:
+  backbone:
+    name: depth-anything/Depth-Anything-V2-Small-hf
+    freeze: true
+  peft:
+    bottleneck: 48
+    drop_path: 0.1
+
+inference:
+  palm_clearance: 0.010   # 축방향 손바닥 여유: 중심 -approach 10mm + depth +10mm (손끝 보존)
+  width_clip: 0.1         # CD 전 평가자 규약 [0,0.1] clip

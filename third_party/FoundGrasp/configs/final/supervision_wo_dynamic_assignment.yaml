@@ -1,8 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Table VII: replace prediction-aware multi-hypothesis assignment with the
-# fixed top-1 target while retaining all other supervision components.
-
-training:
-  loss_functions:
-    prediction_aware_assignment: false

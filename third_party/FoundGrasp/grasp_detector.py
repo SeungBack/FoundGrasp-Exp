@@ -2,6 +2,7 @@ import os
 from abc import ABC, abstractmethod
 
 import cv2
+import time
 import numpy as np
 import torch
 
@@ -49,7 +50,7 @@ class GraspDetector(ABC):
         color,
         depth,
         intrinsics,
-        top_k=30,
+        top_k=50,
         nms=True,
         use_collision_detection=True,
         collision_voxel_size=0.01,
@@ -59,7 +60,7 @@ class GraspDetector(ABC):
 
 
 class FoundGraspDetector(GraspDetector):
-    def __init__(self, config, checkpoint, device="cuda"):
+    def __init__(self, config, checkpoint, device="cuda", verifier_tag=None, verifier_tof=False):
         self.device = torch.device(device)
         self.config_path = resolve_config_path(config)
         self.config = load_config_with_base(self.config_path)
@@ -79,6 +80,16 @@ class FoundGraspDetector(GraspDetector):
         self.last_vis_sample = None
         self.last_predictions = None
 
+        # optional post-hoc grasp verifier (scripts/verifier_points.Verifier): it reads the feature maps of this same forward
+        # pass, so the backbone still runs once; last_verifier_ms is its per-frame latency (collision-free candidates)
+        self.verifier, self._captured, self.last_verifier_ms = None, {}, None
+        if verifier_tag:
+            import os, sys
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+            from verifier_points import Verifier
+            self.verifier = Verifier(verifier_tag, device=device, patch=self.model.patch_size, tof=verifier_tof)   # tof: time-of-flight camera
+            self.model.decoder.register_forward_hook(lambda m, i, o: self._captured.update(vfm=i[0][-1], geo=i[1], dpt=o))
+
     def detect(
         self,
         color,
@@ -88,6 +99,8 @@ class FoundGraspDetector(GraspDetector):
         nms=True,
         use_collision_detection=True,
         collision_voxel_size=0.01,
+        store_vis=True,
+        use_verifier=True,
     ):
         data, xyz_np = self._prepare_input(color, depth, intrinsics)
 
@@ -122,8 +135,16 @@ class FoundGraspDetector(GraspDetector):
 
         if len(gg) > 0:
             gg = gg.sort_by_score()
-            if use_collision_detection:
+            if use_collision_detection and not (self.verifier is not None and getattr(self.verifier.model, "surf_tau", 0.0) > 0):   # the verifier's grid surface test replaces the cloud check
                 gg = self._filter_collision_free(gg, data["xyz"][0], collision_voxel_size)
+            if use_verifier and self.verifier is not None and len(gg) > 0:   # re-score: detector score x p_free^alpha x expected force closure
+                torch.cuda.synchronize(self.device); t0 = time.perf_counter()
+                g_t = torch.from_numpy(gg.grasp_group_array).to(self.device)
+                p = self.verifier.p_free(g_t, data["xyz"][0], {k: v[0] for k, v in self._captured.items()}, max_w=0.1)
+                torch.cuda.synchronize(self.device); self.last_verifier_ms = (time.perf_counter() - t0) * 1000
+                gg.grasp_group_array[:, 0] *= p.cpu().numpy()
+                gg.grasp_group_array[:, [1, 3]] = g_t[:, [1, 3]].cpu().numpy()   # width and depth chosen by the verifier (VERIFIER_SELECT)
+                gg = gg.sort_by_score()
             # to_grasp_group already performs voxel candidate reduction.
             # This final GraspGroup NMS is for execution-time grasp diversity.
             if nms and len(gg) > 0:
@@ -136,7 +157,8 @@ class FoundGraspDetector(GraspDetector):
 
         self.last_xyz = xyz_np
         self.last_predictions = predictions
-        self.last_vis_sample = self._make_vis_sample(data, predictions)
+        if store_vis:
+            self.last_vis_sample = self._make_vis_sample(data, predictions)
         return gg
 
     def _filter_collision_free(self, gg, xyz, voxel_size):
@@ -148,7 +170,7 @@ class FoundGraspDetector(GraspDetector):
         points = _flatten_valid_xyz_points(xyz)
         mfcdetector = ModelFreeCollisionDetectorGPU(points, voxel_size=voxel_size, device=self.device)
         gg_array = torch.from_numpy(gg.grasp_group_array).to(self.device)
-        no_collision_mask = mfcdetector.detect(gg_array, min_inner_points=5)
+        no_collision_mask = mfcdetector.detect(gg_array)
         return gg[no_collision_mask]
 
     def _prepare_input(self, color, depth, intrinsics):

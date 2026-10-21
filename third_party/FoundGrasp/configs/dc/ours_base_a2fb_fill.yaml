@@ -1,0 +1,11 @@
+__base__: '../ours_base.yaml'
+
+# FoundGrasp-B fed Any2Full-B completion, fill-only diagnostic (valid sensor depth kept).
+# Depth trees are written by scripts/dc_precompute.py; everything else is the ours_base recipe.
+datasets:
+  GraspNet1B:
+    depth_root: '/data/Grasp/dc_work/any2full_vitb_fill/GraspNet-1Billion'
+  GraspClutter6D:
+    depth_root: '/data/Grasp/dc_work/any2full_vitb_fill/GraspClutter6D'
+dataset:
+  depth_root: '/data/Grasp/dc_work/any2full_vitb_fill/GraspNet-1Billion'

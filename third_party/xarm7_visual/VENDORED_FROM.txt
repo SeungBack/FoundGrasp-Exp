@@ -1,0 +1,9 @@
+Source : https://github.com/xArm-Developer/xarm_ros
+Commit : cf51617d98bc55a88d9aa735acfa43a0bbb8e425
+Files  : xarm_description/meshes/xarm7_1305/visual/*.dae
+License: BSD-3-Clause (UFACTORY), see LICENSE
+Derived: link_base, link1..link7 converted to GLB with trimesh/pycollada.
+         Original scene transforms and white/gray materials retained.
+         Source assets have no image texture maps.
+Rebuild: python scripts/build_xarm_visuals.py (requires trimesh, pycollada)
+Use    : visualization only; MJCF kinematics and robot control unchanged.

@@ -139,13 +139,14 @@ class XArm7:
             return None
         return [float(np.degrees(a)) for a in angles[:7]]
 
-    def move_flange(self, T_base_flange, speed_mm_s=60):
+    def move_flange(self, T_base_flange, speed_mm_s=60, acc_mm_s2=None):
         """플랜지를 목표 SE(3)로 직선 이동. 실패 시 예외 대신 False 반환."""
         pose = self._flange_to_tcp_pose(T_base_flange)
         code = self.arm.set_position(
             x=pose[0], y=pose[1], z=pose[2],
             roll=pose[3], pitch=pose[4], yaw=pose[5],
             speed=speed_mm_s, is_radian=True, wait=True,
+            **({"mvacc": float(acc_mm_s2)} if acc_mm_s2 is not None else {}),
         )
         if code != 0:
             self.arm.clean_error()

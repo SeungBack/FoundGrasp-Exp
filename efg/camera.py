@@ -12,48 +12,75 @@ import time
 import numpy as np
 
 
+class CameraError(RuntimeError):
+    """카메라 오류 또는 프레임 갱신 중단 — 이전 프레임으로 진행하지 않는다."""
+
+
 class D435:
     def __init__(self, width=1280, height=720, fps=30,
-                 postprocess=True, warmup_frames=15):
+                 postprocess=True, warmup_frames=15, frame_timeout_s=2.0):
         import pyrealsense2 as rs
 
+        self.frame_timeout_s = float(frame_timeout_s)
+        if self.frame_timeout_s <= 0:
+            raise ValueError("frame_timeout_s는 양수여야 합니다")
         self.pipeline = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-        profile = self.pipeline.start(cfg)
-        self.align = rs.align(rs.stream.color)
-        self.depth_scale = (profile.get_device().first_depth_sensor()
-                            .get_depth_scale())
+        self._started = False
+        try:
+            cfg = rs.config()
+            cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+            cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+            profile = self.pipeline.start(cfg)
+            self._started = True
+            self.align = rs.align(rs.stream.color)
+            self.depth_scale = (profile.get_device().first_depth_sensor()
+                                .get_depth_scale())
 
-        self.filters = []
-        if postprocess:
-            self.filters = [
-                rs.disparity_transform(True),
-                rs.spatial_filter(),
-                rs.temporal_filter(),
-                rs.disparity_transform(False),
-            ]
+            self.filters = []
+            if postprocess:
+                self.filters = [
+                    rs.disparity_transform(True),
+                    rs.spatial_filter(),
+                    rs.temporal_filter(),
+                    rs.disparity_transform(False),
+                ]
 
-        intr = (profile.get_stream(rs.stream.color)
-                .as_video_stream_profile().get_intrinsics())
-        self.K = np.array([[intr.fx, 0.0, intr.ppx],
-                           [0.0, intr.fy, intr.ppy],
-                           [0.0, 0.0, 1.0]], dtype=np.float32)
+            intr = (profile.get_stream(rs.stream.color)
+                    .as_video_stream_profile().get_intrinsics())
+            self.K = np.array([[intr.fx, 0.0, intr.ppx],
+                               [0.0, intr.fy, intr.ppy],
+                               [0.0, 0.0, 1.0]], dtype=np.float32)
 
-        for _ in range(warmup_frames):
-            self._raw_frame()
+            for _ in range(warmup_frames):
+                self._raw_frame()
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass  # 정리 오류가 원래 초기화 오류를 가리지 않도록 한다.
+            raise
 
     @classmethod
     def from_config(cls, cfg, warmup_frames=None):
         c = cfg["camera"]
         return cls(c["width"], c["height"], c["fps"],
                    postprocess=c["postprocess"],
+                   frame_timeout_s=c.get("frame_timeout_s", 2.0),
                    warmup_frames=(c["warmup_frames"] if warmup_frames is None
                                   else warmup_frames))
 
     def _raw_frame(self):
-        frames = self.align.process(self.pipeline.wait_for_frames())
+        # wait_for_frames/try_wait_for_frames는 단절 시 내부에서 재시작까지
+        # 시도하여 지정 timeout보다 오래 멈출 수 있다. poll로 직접 기한을 둔다.
+        deadline = time.monotonic() + self.frame_timeout_s
+        while True:
+            frames = self.pipeline.poll_for_frames()
+            if frames:
+                break
+            if time.monotonic() >= deadline:
+                raise CameraError(f"카메라 프레임 수신 시간 초과 ({self.frame_timeout_s:g}초)")
+            time.sleep(0.005)
+        frames = self.align.process(frames)
         depth = frames.get_depth_frame()
         for f in self.filters:
             depth = f.process(depth)
@@ -68,7 +95,15 @@ class D435:
         return rgb, depth_m, self.K
 
     def close(self):
-        self.pipeline.stop()
+        if not self._started:
+            return
+        self._started = False
+        try:
+            self.pipeline.stop()
+        except RuntimeError as exc:
+            # SDK의 재연결 실패 경로가 pipeline을 먼저 멈추는 경우가 있다.
+            if "stop() cannot be called before start()" not in str(exc):
+                raise
 
     def __enter__(self):
         return self
@@ -124,42 +159,85 @@ class CameraStream(threading.Thread):
         self.roi_px = cfg.get("scan_roi_px")
         self._lock = threading.Lock()
         self._latest = None
+        self._latest_at = None
+        self._max_frame_age_s = float(cfg.get("camera", {}).get("max_frame_age_s", 2.0))
+        self._error = None
+        self._finished = threading.Event()
         self._status = "INIT"
         self._marks = []
         self._stop_evt = threading.Event()  # 이름 주의: Thread._stop() 가림 방지
         self.quit_requested = False  # 라이브 창에서 q 입력 시 True
 
     def run(self):
-        import cv2
+        cv2 = None
+        try:
+            import cv2
 
-        from .roi import draw_overlay
+            from .roi import draw_overlay
 
-        while not self._stop_evt.is_set():
-            try:
+            while not self._stop_evt.is_set():
                 rgb, depth_m, K = self.cam.get_frame()
-            except RuntimeError as e:
-                print(f"카메라 프레임 오류: {e}")
-                break
-            with self._lock:
-                self._latest = (rgb, depth_m, K)
-                status, marks = self._status, list(self._marks)
-            if self.live:
-                bgr = np.ascontiguousarray(rgb[:, :, ::-1])
-                draw_overlay(bgr, self.roi_px, status, marks)
-                cv2.imshow(self.WINDOW, bgr)
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    self.quit_requested = True
-        self.cam.close()
-        if self.live:
-            cv2.destroyAllWindows()
+                with self._lock:
+                    self._latest = (rgb, depth_m, K)
+                    self._latest_at = time.monotonic()
+                    status, marks = self._status, list(self._marks)
+                if self.live:
+                    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+                    draw_overlay(bgr, self.roi_px, status, marks)
+                    cv2.imshow(self.WINDOW, bgr)
+                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        self.quit_requested = True
+        except Exception as exc:
+            if not self._stop_evt.is_set():
+                self._record_error(exc)
+        finally:
+            try:
+                self.cam.close()
+            except Exception as exc:
+                self._record_error(exc)
+            finally:
+                if self.live and cv2 is not None:
+                    try:
+                        cv2.destroyAllWindows()
+                    except Exception as exc:
+                        self._record_error(exc)
+                self._finished.set()
 
-    def snapshot(self):
-        """최신 프레임 (rgb, depth_m, K) 사본. 아직 없으면 대기."""
+    def _record_error(self, exc):
+        with self._lock:
+            first = self._error is None
+            if first:
+                self._error = exc
+            self._latest = self._latest_at = None
+        if first:
+            print(f"카메라 스트림 오류: {exc}", flush=True)
+
+    def _check_locked(self):
+        if self._error is not None:
+            raise CameraError(f"카메라 스트림 실패: {self._error}") from self._error
+        if self._stop_evt.is_set() or self._finished.is_set():
+            raise CameraError("카메라 스트림이 종료되었습니다")
+        if self._latest_at is not None:
+            age = time.monotonic() - self._latest_at
+            if age > self._max_frame_age_s:
+                raise CameraError(f"카메라 프레임 갱신 중단 ({age:.1f}초)")
+
+    def raise_if_failed(self):
+        """SDK 재연결 대기 중의 오래된 프레임도 동작 전에 차단한다."""
+        with self._lock:
+            self._check_locked()
+
+    def snapshot(self, timeout=5.0):
+        """정상 최신 프레임 사본. 최초 프레임 대기에도 시간 한도를 둔다."""
+        deadline = time.monotonic() + timeout
         while True:
             with self._lock:
+                self._check_locked()
                 if self._latest is not None:
                     rgb, d, K = self._latest
                     return rgb.copy(), d.copy(), K.copy()
+            if time.monotonic() >= deadline:
+                raise CameraError(f"카메라 최초 프레임 대기 시간 초과 ({timeout:g}초)")
             time.sleep(0.05)
 
     def set_status(self, text):
@@ -172,4 +250,5 @@ class CameraStream(threading.Thread):
 
     def stop(self):
         self._stop_evt.set()
-        self.join(timeout=5)
+        if self.ident is not None:
+            self.join(timeout=6)

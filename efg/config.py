@@ -17,6 +17,7 @@ from .paths import DEFAULT_CONFIG, resolve
 PATH_KEYS = (
     "calib.hand_eye", "calib.intrinsics",
     "detector.foundgrasp.config", "detector.foundgrasp.checkpoint",
+    "detector.foundgrasp.refiner.weights",
     "floor_limit.map_path", "payload_check.baseline_path", "output.dir",
 )
 

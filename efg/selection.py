@@ -1,12 +1,17 @@
-"""그립 후보 선정 — score 상위 순으로 필터 + 로봇 IK 적합성 체크.
+"""그립 후보 선정 — score 순위대로 기하·로봇 IK 적합성을 검사해 첫 통과 후보 채택.
 
-pre-grasp / grasp / lift 세 자세가 모두 IK 가능해야 채택한다.
+pre-grasp / grasp / 홈 방향 transfer 경유 자세가 모두 IK 가능해야 채택한다.
 평행 그리퍼의 y/-y 등가성 때문에 자세당 두 방향(closing_sign ±1)을 시도한다.
+
+공정성: score는 순위로만 쓴다. 방법마다 score 분포가 달라 절대값 기준(최소 score,
+score 차 이내 수직 우선)은 방법 간 비교를 왜곡하므로 두지 않는다. 폭 한계·충돌
+필터는 앞 단계(efg/postprocess.py)에서 모든 방법에 똑같이 적용된다.
 """
 from dataclasses import dataclass, field
 
 import numpy as np
 
+from .motion import transfer_waypoint
 from .transforms import (approach_tilt_deg, grasp_to_base, lifted,
                          offset_along_tool_z, tool_pose_from_grasp)
 
@@ -15,7 +20,8 @@ from .transforms import (approach_tilt_deg, grasp_to_base, lifted,
 class SelectedGrasp:
     index: int
     score: float
-    width_m: float
+    width_m: float          # 검출기 raw 예측 폭
+    open_width_m: float     # 실행 개방 폭 (postprocess.open_width_m)
     closing_sign: int
     T_tcp_grasp: np.ndarray
     T_tcp_pre: np.ndarray
@@ -78,18 +84,16 @@ def _camera_lateral_dir_tcp(cfg, robot):
 
 
 def select_grasp(gg, T_base_cam, cfg, robot=None):
-    """gg(카메라 좌표계, score 내림차순)에서 실행 가능 후보 선정.
+    """gg(카메라 좌표계, score 내림차순)에서 순위대로 첫 실행 가능 후보 선정.
 
-    기본은 score 상위 순이지만, 최고 실행가능 score와의 차이가
-    score_tie_tolerance 이내인 후보들 중에서는 접근이 가장 수직에 가까운
-    것을 선택한다 (수직 파지의 성공률이 높음 — 2026-07-21 현장 관찰).
     robot이 None이면 IK 체크를 건너뛰고 기하 필터만 적용한다.
     반환: SelectionReport (selected가 None이면 실패).
     """
+    from .postprocess import open_width_m
+
     sel = cfg["selection"]
     xs, ys, zs = (sel["workspace_x_m"], sel["workspace_y_m"],
                   sel["workspace_z_m"])
-    tol = float(sel.get("score_tie_tolerance", 0.0))
     # camera_up (옵션, 기본 off): 손목 카메라가 아래(바닥·박스)를 향하는 자세를
     # 배제 — sign 두 해 중 카메라 상향 쪽 우선, 하향 한도 초과 해는 탈락
     cam_cfg = sel.get("camera_up") or {}
@@ -98,20 +102,9 @@ def select_grasp(gg, T_base_cam, cfg, robot=None):
     cam_min_updot = -np.sin(np.radians(float(cam_cfg.get("max_down_deg",
                                                          20.0))))
     report = SelectionReport()
-    pool = []  # score band 안의 실행 가능 후보들
 
     for i in range(len(gg)):
         g = gg[i]
-        # 이미 실행 가능 후보가 있고 score band를 벗어나면 탐색 종료
-        if pool and g.score < pool[0].score - tol:
-            break
-        if g.score < sel["min_score"]:
-            report.rejected.append((i, f"score {g.score:.3f} < min"))
-            continue
-        if g.width > sel["max_grasp_width_m"]:
-            report.rejected.append((i, f"width {g.width * 1000:.0f}mm > max"))
-            continue
-
         R_b, p_b = grasp_to_base(T_base_cam, g)
         if not (xs[0] <= p_b[0] <= xs[1] and ys[0] <= p_b[1] <= ys[1]
                 and zs[0] <= p_b[2] <= zs[1]):
@@ -147,17 +140,17 @@ def select_grasp(gg, T_base_cam, cfg, robot=None):
             T_lift = lifted(T_grasp, sel["lift_height_m"])
             wrist = None
             if robot is not None and sel.get("ik_check_per_candidate", True):
-                bad = next((name for name, T in
-                            [("pre", T_pre), ("grasp", T_grasp),
-                             ("lift", T_lift)] if not _ik_ok(robot, T)), None)
+                T_transfer, _ = transfer_waypoint(T_pre, T_lift, cfg.get("drop", {}), robot.R_home_tcp)
+                poses = [("pre", T_pre), ("grasp", T_grasp),
+                         ("transfer", T_transfer)]
+                bad = next((name for name, T in poses if not _ik_ok(robot, T)), None)
                 if bad is not None:
                     report.rejected.append(
                         (i, f"IK 불가 ({bad}, sign={sign:+d})"))
                     continue
-                # 세 자세 모두 J7 해가 허용 범위 안이어야 함
+                # 실행 경유점까지 모든 자세의 J7 해가 허용 범위 안이어야 함
                 j7_out = None
-                for name, T in [("pre", T_pre), ("grasp", T_grasp),
-                                ("lift", T_lift)]:
+                for name, T in poses:
                     j7 = _j7_deg(robot, T)
                     if j7 is not None and not (j7_lo <= j7 <= j7_hi):
                         j7_out = (name, j7)
@@ -184,22 +177,10 @@ def select_grasp(gg, T_base_cam, cfg, robot=None):
                 print(f"   sign 선택: {feasible[0][0]:+d} "
                       f"(J7 회전 {feasible[0][4]:.0f}° vs {feasible[1][4]:.0f}°)")
         sign, T_grasp, T_pre, T_lift, _, _ = feasible[0]
-        pool.append(SelectedGrasp(
+        report.selected = SelectedGrasp(
             index=i, score=float(g.score), width_m=float(g.width),
+            open_width_m=open_width_m(g.width, cfg),
             closing_sign=sign, T_tcp_grasp=T_grasp, T_tcp_pre=T_pre,
-            T_tcp_lift=T_lift, p_base=p_b, tilt_deg=float(tilt)))
-
-    if pool:
-        top = pool[0]  # 최고 score 실행 가능 후보
-        pool.sort(key=lambda c: (c.tilt_deg, -c.score))
-        chosen = pool[0]
-        if chosen.index != top.index:
-            print(f"   수직 우선 선택: #{chosen.index} "
-                  f"(tilt {chosen.tilt_deg:.0f}°, score {chosen.score:.3f}) "
-                  f"← 최고점 #{top.index} (tilt {top.tilt_deg:.0f}°, "
-                  f"Δscore {top.score - chosen.score:.3f}, band {len(pool)}개)")
-        elif len(pool) > 1:
-            print(f"   수직 우선 확인: 최고점 #{top.index}가 band {len(pool)}개 중 "
-                  f"가장 수직 (tilt {top.tilt_deg:.0f}°)")
-        report.selected = chosen
+            T_tcp_lift=T_lift, p_base=p_b, tilt_deg=float(tilt))
+        break
     return report

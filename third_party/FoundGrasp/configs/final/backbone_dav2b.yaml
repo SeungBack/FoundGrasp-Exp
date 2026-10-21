@@ -1,9 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Backbone selection: Depth Anything V2 Base.
-# This file changes only the frozen vision backbone.
-
-model:
-  backbone:
-    name: depth-anything/Depth-Anything-V2-Base-hf
-    freeze: true

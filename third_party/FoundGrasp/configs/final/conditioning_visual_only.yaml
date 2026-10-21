@@ -1,9 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Table VI — Visual only (zero geometry): no adapter and no head depth fusion.
-
-model:
-  peft:
-    type: 'none'
-  grasp_head:
-    rgbd_fusion_type: 'none'

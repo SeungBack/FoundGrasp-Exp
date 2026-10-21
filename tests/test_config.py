@@ -40,12 +40,12 @@ def test_set_override_parses_yaml_values():
 def test_base_inheritance_and_null(tmp_path):
     child = tmp_path / "exp.yaml"
     child.write_text(f"base: {DEFAULT_CONFIG}\n"
-                     "selection: {approach_max_tilt_deg: 15, min_score: null}\n"
-                     "live: {enabled: false}\n")
+                     "selection: {approach_max_tilt_deg: 15, lift_height_m: null}\n"
+                     "live: {enabled: true}\n")
     cfg = load_config(child)
     assert cfg["selection"]["approach_max_tilt_deg"] == 15
-    assert cfg["selection"]["min_score"] == 0.1  # null = 미설정 → base 유지
-    assert cfg["live"]["enabled"] is False
+    assert cfg["selection"]["lift_height_m"] == 0.15  # null = 미설정 → base 유지
+    assert cfg["live"]["enabled"] is True
     assert cfg["robot"]["ip"]  # 나머지는 base에서
 
 

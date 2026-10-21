@@ -168,24 +168,11 @@ If `--checkpoint` is omitted, `test.py` uses the latest
 `checkpoint_epoch_*.pth` under the matching log directory.
 
 ```bash
-python test.py \
-  --config configs/final/foundgrasp_base.yaml \
+CUDA_VISIBLE_DEVICES=0 python test.py \
+  --config configs/ablation/conditioning_repr_only.yaml \
   --infer --eval \
   --camera realsense \
-  --split test_seen \
-  --batch_size 16 \
-  --num_workers 8
-```
-
-Evaluate a specific checkpoint:
-
-```bash
-python test.py \
-  --config configs/final/foundgrasp_base.yaml \
-  --checkpoint logs/final/foundgrasp_base/checkpoints/final_model.pth \
-  --infer --eval \
-  --camera realsense \
-  --split test_seen \
+  --split test \
   --batch_size 16 \
   --num_workers 8
 ```
@@ -193,9 +180,8 @@ python test.py \
 Evaluate on GraspClutter6D:
 
 ```bash
-python test.py \
-  --config configs/final/foundgrasp_base.yaml \
-  --checkpoint logs/final/foundgrasp_base/checkpoints/final_model.pth \
+CUDA_VISIBLE_DEVICES=1 python test.py \
+  --config configs/ablation/conditioning_repr_only.yaml \
   --infer --eval \
   --dataset GraspClutter6D \
   --camera realsense-d435 \
@@ -240,4 +226,19 @@ python tools/visualize_depth_corruption.py \
   --split train \
   --force-prob 1.0 \
   --save-dir figures/depth_corruption
+```
+
+
+```
+CUDA_VISIBLE_DEVICES=0 python train.py --config configs/final/foundgrasp_large_kinect.yaml
+CUDA_VISIBLE_DEVICES=1 python train.py --config configs/final/foundgrasp_large_kinect_.yaml
+
+CUDA_VISIBLE_DEVICES=0 bash scripts/train_queue_rc0.sh
+CUDA_VISIBLE_DEVICES=1 bash scripts/train_queue_rc1.sh
+CUDA_VISIBLE_DEVICES=2 bash scripts/train_queue_rc2.sh
+CUDA_VISIBLE_DEVICES=3 bash scripts/train_queue_rc3.sh
+CUDA_VISIBLE_DEVICES=4 bash scripts/train_queue_rc4.sh
+
+
+
 ```

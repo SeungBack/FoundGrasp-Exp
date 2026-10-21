@@ -1,9 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Table VII: remove gripper-axis antipodal symmetry only.
-
-training:
-  loss_functions:
-    gripper:
-      type: acosine_similarity
-      weight: 3.0

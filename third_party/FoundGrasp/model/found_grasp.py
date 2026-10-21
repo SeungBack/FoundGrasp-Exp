@@ -281,6 +281,18 @@ class FoundGrasp(nn.Module):
         else:
             self.num_prefix = 1 + getattr(self.backbone.config, "num_register_tokens", 0)
         self.apply_layernorm = getattr(self.backbone.config, "apply_layernorm", False)
+
+        # Input-level geometry fusion (ablation): xyz enters through a zero-initialized
+        # patch-embed extension; equivalent to widening the pretrained patch conv from
+        # 3 to 6 input channels with the RGB weights kept frozen. Lives outside
+        # self.backbone so the freeze loop leaves it trainable.
+        self.xyz_patch_embed = None
+        if self.cfg.backbone.get('xyz_patch_embed', False):
+            if self.is_sam or self.is_dinov3:
+                raise NotImplementedError("xyz_patch_embed supports sequence-format HF backbones (DA2/DINOv2) only.")
+            self.xyz_patch_embed = nn.Conv2d(3, self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
+            nn.init.zeros_(self.xyz_patch_embed.weight)
+            nn.init.zeros_(self.xyz_patch_embed.bias)
         # Different backbones expose their final norm under different attribute names.
         # Cache a reference so forward() doesn't need to branch.
         if self.apply_layernorm or self.is_da3:
@@ -561,6 +573,15 @@ class FoundGrasp(nn.Module):
         else:
             x = self.backbone.embeddings(pixel_values)
 
+        # Input-level geometry fusion: add zero-initialized xyz patch tokens to the
+        # spatial tokens (addition after the linear patch projection == a 6-channel
+        # patch conv). At initialization the model is exactly the pretrained backbone.
+        if self.xyz_patch_embed is not None:
+            xyz_tokens = self.xyz_patch_embed(depth_values[:, :3])          # (B, C, h, w)
+            xyz_tokens = xyz_tokens.flatten(2).transpose(1, 2)              # (B, h*w, C)
+            x = torch.cat([x[:, :-xyz_tokens.shape[1], :],
+                           x[:, -xyz_tokens.shape[1]:, :] + xyz_tokens], dim=1)
+
         # Depth
         depth_feat = self.depth_encoder(depth_values)
         depth_feat_gated = depth_feat
@@ -786,7 +807,10 @@ class FoundGrasp(nn.Module):
                     empty_grasp_min_points=0,
                     segm_erosion_k=0,
                     max_grasps=2048,
-                    voxel_size=0.004):
+                    voxel_size=0.004,
+                    palm_clearance=0.0,
+                    width_clip=None,
+                    return_extras=False):
         """
         Convert pixel-wise model predictions to GraspGroup format.
 
@@ -902,6 +926,12 @@ class FoundGrasp(nn.Module):
             valid_indices = valid_indices[keep]
 
         if len(valid_indices) == 0:
+            if return_extras:
+                _z = np.zeros((0,), dtype=np.float32)
+                return GraspGroup(), {
+                    'v': _z.astype(np.int32), 'u': _z.astype(np.int32),
+                    'graspness': _z, 'grasp_score': _z, 'width_raw': _z,
+                    'depth_edge_range': _z, 'erosion_level': _z.astype(np.int8)}
             return GraspGroup()
 
         # Extract all needed tensors on GPU (single batch, no intermediate CPU transfers)
@@ -924,6 +954,16 @@ class FoundGrasp(nn.Module):
         rotations_t, valid_rot = _build_rotation_matrices_gpu(approaches_t, grippers_t)
         final_mask = valid_rot  # bool tensor on GPU
 
+        # width clip: 평가자는 채점 전 width를 [0, 0.1]로 자르므로 CD도 같은 폭으로 검사
+        if width_clip is not None:
+            widths_t = widths_t.clamp(max=float(width_clip))
+        # palm clearance: 중심을 approach 반대로 δ 후퇴 + depth를 δ 연장.
+        # 손끝(=depth 끝) 위치는 보존되고 손바닥(뒷판)만 δ 물러난다.
+        # width_multiplier가 측면 여유이듯 이것은 축방향 여유 상수.
+        if palm_clearance > 0:
+            centers_t = centers_t - float(palm_clearance) * approaches_t
+            depths_t = depths_t + float(palm_clearance)
+
         if empty_grasp_min_points > 0 and final_mask.any():
             scene_pts = xyz[:, valid_depth_mask].T.float()
             scene_pts = _voxel_downsample_gpu(scene_pts, float(0.008))
@@ -940,6 +980,7 @@ class FoundGrasp(nn.Module):
 
         # Single CPU transfer at the end
         gg = GraspGroup()
+        idx = None
         if final_mask.any():
             idx = torch.where(final_mask)[0]
             grasp_group_array = np.zeros((len(idx), 17), dtype=np.float32)
@@ -950,5 +991,38 @@ class FoundGrasp(nn.Module):
             grasp_group_array[:, 4:13] = rotations_t[idx].reshape(-1, 9).detach().cpu().numpy()
             grasp_group_array[:, 13:16] = centers_t[idx].detach().cpu().numpy()
             gg.grasp_group_array = grasp_group_array
+
+        if return_extras:
+            # 오프라인 후처리 스윕용 sidecar: 픽셀 좌표, 랭킹 성분, 배수 적용 전 폭,
+            # depth 불연속(구 depth_edge_thresh, k=5 창의 국소 z 범위), objectness 침식 생존 레벨.
+            F_ = torch.nn.functional
+            z_map = xyz[2]
+            d_for_max = torch.where(valid_depth_mask, z_map, torch.zeros_like(z_map))
+            d_for_min = torch.where(valid_depth_mask, z_map, torch.full_like(z_map, 1e4))
+            d_max = F_.max_pool2d(d_for_max[None, None], kernel_size=5, stride=1, padding=2)[0, 0]
+            d_min = -F_.max_pool2d(-d_for_min[None, None], kernel_size=5, stride=1, padding=2)[0, 0]
+            edge_range_map = (d_max - d_min).clamp(min=0) * valid_depth_mask.float()
+            ero_level = torch.zeros_like(segm_fg)
+            for k in (1, 2, 3):
+                bg_d = F_.max_pool2d((1 - segm_fg)[None, None],
+                                     kernel_size=2 * k + 1, stride=1, padding=k)[0, 0]
+                ero_level = torch.where(bg_d < 0.5, torch.full_like(ero_level, float(k)), ero_level)
+            if idx is None:
+                _z = np.zeros((0,), dtype=np.float32)
+                extras = {'v': _z.astype(np.int32), 'u': _z.astype(np.int32),
+                          'graspness': _z, 'grasp_score': _z, 'width_raw': _z,
+                          'depth_edge_range': _z, 'erosion_level': _z.astype(np.int8)}
+            else:
+                vi_k, ui_k = vi[idx], ui[idx]
+                extras = {
+                    'v': vi_k.detach().cpu().numpy().astype(np.int32),
+                    'u': ui_k.detach().cpu().numpy().astype(np.int32),
+                    'graspness': graspness[vi_k, ui_k].float().detach().cpu().numpy(),
+                    'grasp_score': grasp_score[vi_k, ui_k].float().detach().cpu().numpy(),
+                    'width_raw': grasp_width[vi_k, ui_k].float().detach().cpu().numpy(),
+                    'depth_edge_range': edge_range_map[vi_k, ui_k].float().detach().cpu().numpy(),
+                    'erosion_level': ero_level[vi_k, ui_k].detach().cpu().numpy().astype(np.int8),
+                }
+            return gg, extras
 
         return gg

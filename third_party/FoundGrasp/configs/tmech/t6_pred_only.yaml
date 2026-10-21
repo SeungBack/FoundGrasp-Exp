@@ -1,5 +1,0 @@
-__base__: './t4_frozen_noadapter.yaml'
-
-# Table VI Row 2 — Prediction-level only (no adapter, head depth)
-# No representation-level injection; depth enters only at the grasp head.
-# Identical experiment to t4_frozen_noadapter.yaml — aliased for Table VI runs.

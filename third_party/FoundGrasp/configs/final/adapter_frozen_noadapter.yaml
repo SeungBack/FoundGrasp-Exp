@@ -1,9 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Table IV — Frozen backbone, no adapter. Isolates the freezing effect from the
-# adapter effect (compare vs adapter_ft_noadapter and vs Ours).
-# Also serves as Table VI "prediction-only" (head depth, no representation injection).
-
-model:
-  peft:
-    type: 'none'

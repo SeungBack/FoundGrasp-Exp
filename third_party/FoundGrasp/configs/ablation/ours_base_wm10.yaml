@@ -1,0 +1,6 @@
+__base__: '../ours_base.yaml'
+
+# E4a-prime (2026-10-07): detector-only decoding without the 1.2x width margin of the GraspNet-baseline convention.
+# Same checkpoint as ours_base (pass --checkpoint logs/ours_base/checkpoints/final_model.pth); only inference changes.
+inference:
+  width_multiplier: 1.0

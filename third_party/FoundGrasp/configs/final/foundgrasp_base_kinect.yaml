@@ -1,6 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Table II — Ours DAv2-B (GraspNet-1B, Kinect). Anchor model on Kinect.
-
-dataset:
-  camera: 'kinect'

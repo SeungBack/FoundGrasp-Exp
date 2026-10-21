@@ -1,9 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Table VII: train only on sparse projected labels, without depth-aware
-# propagation to neighboring pixels.
-
-training:
-  loss_functions:
-    propagate_gt: false
-    confidence_weighting: false

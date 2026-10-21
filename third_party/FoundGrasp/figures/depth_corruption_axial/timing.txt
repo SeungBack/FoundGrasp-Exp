@@ -1,8 +1,0 @@
-clean_fetch_ms_mean: 55.992
-clean_fetch_ms_std: 5.389
-corrupt_fetch_ms_mean: 84.351
-corrupt_fetch_ms_std: 5.849
-overhead_ms_mean: 28.360
-overhead_ratio: 50.65%
-warmup: 3
-repeats: 20

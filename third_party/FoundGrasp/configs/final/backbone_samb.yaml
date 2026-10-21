@@ -1,8 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Backbone selection: SAM ViT-Base.
-
-model:
-  backbone:
-    name: facebook/sam-vit-base
-    freeze: true

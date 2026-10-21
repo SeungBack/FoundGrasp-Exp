@@ -1,5 +1,0 @@
-__base__: './adapter_frozen_noadapter.yaml'
-
-# Table VI — Prediction-level only: depth enters only at the grasp head, with no
-# representation-level injection. Identical experiment to adapter_frozen_noadapter
-# (Table IV Frozen/no-adapter) — aliased so one run fills both table rows.

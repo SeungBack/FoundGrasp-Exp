@@ -1,7 +1,0 @@
-__base__: './adapter_ft_noadapter.yaml'
-
-# Table IV — Full fine-tuning, no adapter, with layer-wise LR decay (LLRD 0.75).
-# Gentler backbone decay than 0.65.
-
-training:
-  layer_decay_rate: 0.75

@@ -159,10 +159,12 @@ inference:
   objectness_threshold: 0.5
   empty_grasp_min_points: 10
   segm_erosion_k: 3           # morphological erosion on objectness mask; removes boundary grasps
-  gamma_max_abs_deg: 30.0
+  gamma_max_abs_deg: 60.0
   depth_edge_thresh: 0.00             # suppress grasps near depth discontinuities (m); 0=off
   depth_edge_k: 7                    # kernel size for local depth range computation
   max_grasps: 4096
+  palm_clearance: 0.010   # 축방향 손바닥 여유: 중심 -approach 10mm + depth +10mm (손끝 보존)
+  width_clip: 0.1         # CD 전 평가자 규약 [0,0.1] clip
 
 # Wandb configuration
 wandb:

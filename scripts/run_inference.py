@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """[점검] 검출만 실행 — 저장 프레임(npz) 또는 카메라 즉시 캡처 (로봇 불필요).
 
-검출기 동작·설치 확인, 비교군 백엔드 오프라인 검증에 쓴다.
-출력: 후보 수·상위 score, (옵션) 그리퍼 와이어프레임 오버레이 jpg, npy.
+검출기 동작·설치 확인, 비교군 백엔드 오프라인 검증에 쓴다. 실행 루프와 같은
+입력(ROI depth 마스킹)·공유 후처리(폭 한계·충돌필터·정렬)·ROI 필터를 적용한다.
+출력: 단계별 후보 수·상위 score, (옵션) 그리퍼 와이어프레임 오버레이 jpg, npy.
 
   python scripts/run_inference.py --npz tests/data/sample_frame.npz --vis outputs/grasps.jpg
   python scripts/run_inference.py --live --save-npz outputs/frame.npz
   python scripts/run_inference.py --npz ... --set detector.name=<other>   # 비교군
+  python scripts/run_inference.py --npz ... --set detector.foundgrasp.refiner.enabled=false
 """
 import argparse
 from pathlib import Path
@@ -27,8 +29,7 @@ def main():
     ap.add_argument("--save-npz", help="캡처 프레임 저장 경로 (--live 시)")
     ap.add_argument("--out", default=None, help="후보 저장 npy (기본 output.dir/grasps.npy)")
     ap.add_argument("--vis", help="2D 오버레이 저장 경로 (jpg)")
-    ap.add_argument("--top-k", type=int, default=None)
-    ap.add_argument("--roi", action="store_true", help="설정 scan_roi_px 로 ROI 마스킹·필터 적용")
+    ap.add_argument("--no-roi", action="store_true", help="ROI 마스킹·필터 생략 (전체 프레임)")
     args = ap.parse_args()
     cfg = config_from_args(args)
 
@@ -49,22 +50,34 @@ def main():
         ap.error("--npz 또는 --live 중 하나가 필요합니다")
     K = resolve_intrinsics(K, cfg)
 
-    roi = cfg.get("scan_roi_px") if args.roi else None
-    if roi:
-        x1, y1, x2, y2 = [int(v) for v in roi]
-        d = np.zeros_like(depth_m)
-        d[y1:y2, x1:x2] = depth_m[y1:y2, x1:x2]
-        depth_m = d
+    import time
 
+    from efg.postprocess import mask_depth_to_roi, shared_filter
+    from efg.roi import filter_roi
+
+    roi = None if args.no_roi else cfg.get("scan_roi_px")
+    depth_in = mask_depth_to_roi(depth_m, roi) if cfg["postprocess"].get("roi_depth_mask", True) else depth_m
     det = build_detector(cfg)
-    gg = det.detect(rgb, depth_m, K, top_k=args.top_k)
+    try:
+        det.detect(rgb, depth_in, K)  # 워밍업 (CUDA 초기화·캐시) — 시간 측정에서 제외
+        t0 = time.perf_counter()
+        gg = det.detect(rgb, depth_in, K)
+        ms = (time.perf_counter() - t0) * 1000.0
+    finally:
+        det.close()
+    post_t0 = time.perf_counter()
+    gg, counts = shared_filter(gg, depth_m, K, cfg)
     if roi:
-        from efg.roi import filter_roi
-        n_all = len(gg)
         gg = filter_roi(gg, K, roi)
-        print(f"ROI 필터: {n_all} → {len(gg)}")
+        counts["roi"] = len(gg)
+    post_ms = (time.perf_counter() - post_t0) * 1000.0
     top = [round(float(gg[i].score), 3) for i in range(min(5, len(gg)))]
-    print(f"[{det.name}] 그립 후보 {len(gg)}개 (score 내림차순). 상위 5: {top}")
+    print(f"[{det.describe()}] 검출 {ms:.0f}ms + 후처리 {post_ms:.0f}ms"
+          f" = {ms + post_ms:.0f}ms | 단계별 후보 {counts}")
+    print(f"  상위 5 score: {top}")
+    if len(gg):
+        w = gg.widths
+        print(f"  폭(raw) mm: 중앙값 {np.median(w) * 1000:.0f}, 범위 {w.min() * 1000:.0f}–{w.max() * 1000:.0f}")
 
     out = Path(args.out) if args.out else Path(cfg["output"]["dir"]) / "grasps.npy"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -74,12 +87,10 @@ def main():
         import cv2
 
         from efg.roi import draw_overlay
-        from efg.viz import draw_grippers
+        from efg.viz import draw_score_grippers
         vis = np.ascontiguousarray(rgb[:, :, ::-1]).copy()
         draw_overlay(vis, roi)
-        draw_grippers(vis, gg, K, color=(0, 165, 255))
-        if len(gg):
-            draw_grippers(vis, gg[:1], K, color=(0, 0, 255), thickness=2)
+        draw_score_grippers(vis, gg, K, max_n=int(cfg.get("rerun", {}).get("max_candidates", 25)))
         Path(args.vis).parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(args.vis, vis)
         print(f"오버레이: {args.vis}")

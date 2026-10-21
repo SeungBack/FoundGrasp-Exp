@@ -1,0 +1,17 @@
+__base__: './supervision_discrete_all_attributes.yaml'
+
+# Table VII: RGB Matters-style orientation plus discrete score/width/depth.
+# This is the fully discrete image-grid baseline.
+
+training:
+  loss_functions:
+    orientation:
+      type: mse
+      weight: 6.0
+      max_samples: 65536
+      chunk_size: 4096
+      symmetric_gripper: true
+
+inference:
+  palm_clearance: 0.010   # 축방향 손바닥 여유: 중심 -approach 10mm + depth +10mm (손끝 보존)
+  width_clip: 0.1         # CD 전 평가자 규약 [0,0.1] clip

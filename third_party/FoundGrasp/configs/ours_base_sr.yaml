@@ -1,0 +1,15 @@
+__base__: './ours_base.yaml'
+
+# Sensor randomization (2026-09-22): the paper recipe plus an object-coherent axial depth perturbation during
+# training. Motivation: the RealSense-trained model loses 7.5 mean AP on Kinect while the annotation-vs-sensor
+# depth error on Kinect is coherent per object at the +-1..2 cm scale (D - z_cad quantiles [-5.0, -2.1, +0.05,
+# +1.2, +2.7] cm); the earlier gate (1-2 mm i.i.d.-like noise) did not emulate that error. The grasp-depth
+# target is updated on the fly (realized-consistent), so the label pose is unchanged in space.
+training:
+  depth_corruption:
+    type: axial_noise
+    prob: 0.5
+    sigma_range: [0.005, 0.015]   # per-frame scale of the object offsets (m)
+    sigma_depth_scale: 0.0
+    lowres_factor: 32              # weak spatially coherent field on top (0.25 x)
+    object_coherent: true

@@ -1,0 +1,8 @@
+Source : /home/user/Workspaces/FoundGrasp  (https://github.com/SeungBack/FoundGrasp)
+Commit : 3df3043949c97d1db5b6dc481fb22141f98bd434
+Subject: R160: repository hygiene — untrack reference PDFs, logs, LaTeX by-products, Gr
+Copied : 2026-10-07 17:20  — inference subset only, files unmodified.
+  model/ utils/ configs/ datasets/ grasp_detector.py
+  scripts/verifier_{points,grid,sample,readout}.py   (grasp refiner = "verifier" in code)
+  third_parties/graspnetAPI/
+Refresh: rerun this copy step from the paper repo; do not edit files here.

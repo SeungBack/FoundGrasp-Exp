@@ -1,7 +1,0 @@
-__base__: './foundgrasp_base.yaml'
-
-# Table IV — Full fine-tuning + GeoFormer (= Ours but with the backbone unfrozen).
-
-model:
-  backbone:
-    freeze: false

@@ -1,3 +1,0 @@
-## Paper Framing Discipline
-
-Do not let frame before decomposing. For paper framing, first force variable-level comparison: predicted variables, observed variables, classified variables, searched/recovered variables, and post-processing operations. Avoid vague terms until they are formally defined.
