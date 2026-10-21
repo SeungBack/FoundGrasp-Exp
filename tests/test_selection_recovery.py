@@ -19,7 +19,8 @@ def test_candidate_with_unreachable_recovery_is_skipped(monkeypatch):
 
     robot = SimpleNamespace(T_flange_tcp=np.eye(4), R_home_tcp=home_R,
                             check_flange_ik=ik,
-                            flange_ik_joints_deg=lambda T: [0.] * 7)
+                            get_joints_deg=lambda: np.zeros(7),
+                            flange_ik_joints_deg=lambda T: [0.] * 7 if ik(T) else None)
     grasps = [SimpleNamespace(score=1., width=.06, depth=0., x=x) for x in (.2, .3)]
     monkeypatch.setattr(selection, "grasp_to_base", lambda _, g: (np.eye(3), np.array([g.x, 0., .1])))
     monkeypatch.setattr(selection, "approach_tilt_deg", lambda R: 0.)
@@ -36,4 +37,4 @@ def test_candidate_with_unreachable_recovery_is_skipped(monkeypatch):
     upper = [T for T in tested if T[2, 3] > .3]
     assert upper
     for T in upper:
-        np.testing.assert_array_equal(T[:3, :3], home_R)
+        assert any(np.allclose(T[:3, :3], home_R @ np.diag([s, s, 1])) for s in (1, -1))

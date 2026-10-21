@@ -11,6 +11,8 @@ import time
 
 import numpy as np
 
+from .console import detail
+
 
 class CameraError(RuntimeError):
     """카메라 오류 또는 프레임 갱신 중단 — 이전 프레임으로 진행하지 않는다."""
@@ -130,7 +132,7 @@ def resolve_intrinsics(K_stream, cfg):
         return K_stream
     with open(path) as f:
         K = np.asarray(yaml.safe_load(f)["K"], dtype=np.float32)
-    print(f"intrinsics: 캘리브레이션 K 사용 (fx {K[0, 0]:.1f}, {path.name})")
+    detail(f"intrinsics: 캘리브레이션 K 사용 (fx {K[0, 0]:.1f}, {path.name})")
     return K
 
 

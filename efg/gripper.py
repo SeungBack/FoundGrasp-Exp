@@ -22,9 +22,11 @@
   모터를 정지시켜 보호한다. close는 물체 접촉으로 멈추는 게 정상이므로
   잼 보호 없이 정착만 기다린다.
 """
+import math
 import time
 
 from .paths import KORAS_ROOT, add_vendor_paths
+from .console import detail, row
 
 add_vendor_paths(KORAS_ROOT)
 
@@ -45,12 +47,28 @@ class GripperCtl:
         self.force_pct = float(g["force_pct"])
         self.speed_pct = float(g["speed_pct"])
         self.close_min_wait_s = float(g.get("close_min_wait_s", 0.3))
-        if not 0.15 <= self.close_min_wait_s <= 10.0:
-            raise ValueError("gripper.close_min_wait_s는 0.15~10초 범위여야 합니다")
-        self.open_min_wait_s = float(g.get("open_min_wait_s", 0.15))
-        if not 0.15 <= self.open_min_wait_s <= 10.0:
-            raise ValueError("gripper.open_min_wait_s는 0.15~10초 범위여야 합니다")
+        if not 0.05 <= self.close_min_wait_s <= 10.0:
+            raise ValueError("gripper.close_min_wait_s는 0.05~10초 범위여야 합니다")
+        self.open_min_wait_s = float(g.get("open_min_wait_s", 0.05))
+        if not 0.05 <= self.open_min_wait_s <= 10.0:
+            raise ValueError("gripper.open_min_wait_s는 0.05~10초 범위여야 합니다")
+        self.pre_open_min_wait_s = float(g.get("pre_open_min_wait_s", 0.05))
+        if not 0.05 <= self.pre_open_min_wait_s <= 10.0:
+            raise ValueError("gripper.pre_open_min_wait_s는 0.05~10초 범위여야 합니다")
         self.stroke_mm = float(g["stroke_mm"])
+        self.release_mode = g.get("release_mode", "width")
+        self.release_margin_mm = float(g.get("release_margin_mm", 5.0))
+        self.release_confirm_s = float(g.get("release_confirm_s", 0.05))
+        self.release_timeout_s = float(g.get("release_timeout_s", 5.0))
+        if self.release_mode not in ("width", "full"):
+            raise ValueError("gripper.release_mode는 width 또는 full이어야 합니다")
+        if not math.isfinite(self.stroke_mm) or self.stroke_mm <= 0:
+            raise ValueError("gripper.stroke_mm는 유한한 양수여야 합니다")
+        if not 0 < self.release_margin_mm <= self.stroke_mm:
+            raise ValueError("gripper.release_margin_mm는 0 초과, stroke_mm 이하여야 합니다")
+        if not (0 <= self.release_confirm_s <= 2 and
+                self.release_confirm_s < self.release_timeout_s <= 10):
+            raise ValueError("릴리즈 확인 시간은 0~2초, timeout은 확인 시간 초과~10초여야 합니다")
         # 접근 시 개방 폭 여유 (mm). 구 설정(pre_open_margin_pct, 스트로크 %)이
         # 있으면 mm로 환산해 호환 — 전체 개방 접근은 주변 물체와 충돌 위험
         if "pre_open_margin_mm" in g:
@@ -142,7 +160,7 @@ class GripperCtl:
         if not self.g.connect(initialize=False):
             raise RuntimeError(f"그리퍼 포트 열기 실패: {self.port}")
         s = self._require_status()
-        print(f"   그리퍼 상태: {self._fmt_status(s)}")
+        row("그리퍼", self._fmt_status(s))
         if s.fault:
             raise RuntimeError(f"그리퍼 fault 상태 — 전원 재투입 필요 "
                                f"[{self._fmt_status(s)}]")
@@ -215,7 +233,7 @@ class GripperCtl:
                 "복구: 그리퍼 본체 버튼(I)로 재초기화 (Modbus 초기화로는 복구 "
                 "안 됨, 2026-07-21 실측). 임시 우회: gripper.grip_mode: "
                 "\"position\"")
-        print("   close 방향 점검: 정상")
+        row("방향 점검", "정상")
 
     def _initialize(self):
         """초기화 스윕 실행 + 완료까지 자체 대기 (원본 connect()의 8초 한도·
@@ -370,17 +388,94 @@ class GripperCtl:
         """
         open_mm = width_m * 1000.0 + self.pre_open_margin_mm
         pct = min(100.0, open_mm / self.stroke_mm * 100.0)
-        print(f"   pre-open 목표: {pct:.0f}% (그립 폭 {width_m * 1000:.0f}mm + "
+        detail(f"pre-open 목표: {pct:.0f}% (그립 폭 {width_m * 1000:.0f}mm + "
               f"여유 {self.pre_open_margin_mm:.0f}mm)")
         if not self._move_cmd(lambda: self._set_raw_open_pct(pct), pct, "pre-open", check=check):
             return False
-        ok, s = self._wait_settle(jam_protect=True, check=check)
+        ok, s = self._wait_settle(jam_protect=True,
+                                  min_wait_s=self.pre_open_min_wait_s, check=check)
         if not (ok and self._reached(s, pct)):
             pos = None if s is None else round(self._pos_pct(s), 1)
             print(f"경고: pre-open 실패 (목표 {pct:.0f}%, 실제 {pos}%) — "
                   "그리퍼 상태 점검 필요")
             return False
         return True
+
+    def release(self, width_m, check=None):
+        """Open fully, returning once the measured release clearance is reached.
+
+        The remaining opening runs in firmware during the return trip. No timer
+        alone declares release, and failure stops the finger command. The width
+        threshold is a release assumption, not object-detachment sensing.
+        """
+        if check:
+            check()
+        if self.release_mode == "full":
+            return self.open()
+        width_mm = float(width_m) * 1000
+        if not math.isfinite(width_mm) or width_mm < 0:
+            raise ValueError("릴리즈 기준 폭은 유한한 0 이상의 값이어야 합니다")
+        released = False
+        try:
+            s = self._read_status()
+            if s is None or s.fault or not s.enabled:
+                print("경고: 릴리즈 상태 확인 실패 — 복귀하지 않습니다")
+                return False
+            start_pct = self._pos_pct(s)
+            if not math.isfinite(start_pct) or not 0 <= start_pct <= 100:
+                print("경고: 릴리즈 시작 위치 판독 오류 — 복귀하지 않습니다")
+                return False
+            release_mm = min(self.stroke_mm, max(width_mm, start_pct * self.stroke_mm / 100)
+                             + self.release_margin_mm)
+            release_pct = release_mm / self.stroke_mm * 100
+            # Fully open commonly reports 99.8%, not exactly 100%. Limit the
+            # tolerance to 0.5 mm and 10% of the requested release margin.
+            tolerance_pct = min(.5, self.release_margin_mm * .1) / self.stroke_mm * 100
+            if not self._move_cmd(lambda: self._set_raw_open_pct(100.0),
+                                  100.0, "릴리즈", check=check):
+                return False
+            deadline = time.monotonic() + self.release_timeout_s
+            reached_since = stall_since = None
+            last = None
+            while time.monotonic() < deadline:
+                if check:
+                    check()
+                s = self._read_status()
+                if s is None or s.fault or not s.enabled:
+                    print("경고: 릴리즈 중 상태 읽기 실패/모터 오류 — 복귀하지 않습니다")
+                    return False
+                now = time.monotonic()
+                pct = self._pos_pct(s)
+                if not math.isfinite(pct) or not 0 <= pct <= 100 or pct < start_pct - .5:
+                    print("경고: 릴리즈 위치 오류/닫힘 방향 이동 — 복귀하지 않습니다")
+                    return False
+                if (last is not None and abs(s.finger_pos - last) <= MOVE_TOL_TICKS
+                        and abs(s.motor_cur) > STALL_CURRENT_MA):
+                    stall_since = now if stall_since is None else stall_since
+                    if now - stall_since >= STALL_HOLD_S:
+                        print("경고: 릴리즈 중 그리퍼 잼 — 복귀하지 않습니다")
+                        return False
+                else:
+                    stall_since = None
+                if pct >= release_pct - tolerance_pct:
+                    reached_since = now if reached_since is None else reached_since
+                    if now - reached_since >= self.release_confirm_s:
+                        released = True
+                        row("릴리즈", f"기준 {release_mm:.1f} mm · 실측 {pct * self.stroke_mm / 100:.1f} mm"
+                            " · 개방 계속 / 복귀 가능")
+                        return True
+                else:
+                    reached_since = None
+                last = s.finger_pos
+                time.sleep(.02)
+            print(f"경고: 릴리즈 폭 {release_mm:.1f}mm 도달 시간 초과 — 복귀하지 않습니다")
+            return False
+        finally:
+            if not released:
+                try:
+                    self.g.stop()
+                except Exception as exc:
+                    print(f"경고: 릴리즈 실패 후 그리퍼 정지 실패 ({exc})")
 
     def grip(self):
         """닫아서 파지. 반환: (success, finger_pos_pct).

@@ -10,6 +10,7 @@ import time
 import numpy as np
 
 from .se3 import inv_se3, pose_delta, xarm_pose_to_se3
+from .console import row
 
 
 class XArm7:
@@ -17,6 +18,7 @@ class XArm7:
         from xarm.wrapper import XArmAPI
 
         self.arm = XArmAPI(ip, is_radian=True)
+        self._motion_initialized = False
         self.arm.clean_warn()
         self.arm.clean_error()
 
@@ -24,7 +26,7 @@ class XArm7:
         self.tcp_offset = [float(v) for v in self.arm.tcp_offset]
         self.T_flange_tcp = xarm_pose_to_se3(self.tcp_offset)
         if np.linalg.norm(self.tcp_offset) > 1e-6:
-            print(f"[robot] TCP offset active {self.tcp_offset} — flange pose로 자동 보정합니다.")
+            row("TCP", f"offset {self.tcp_offset} · 플랜지 좌표 자동 보정")
 
     def get_tcp_pose(self):
         """T_base_tcp (4x4, meters). TCP = flange if no offset is configured."""
@@ -32,6 +34,14 @@ class XArm7:
         if code != 0:
             raise RuntimeError(f"get_position failed (code={code})")
         return xarm_pose_to_se3(pose), [float(v) for v in pose]
+
+    def get_joints_deg(self):
+        """Read actual joint angles for motion-cost comparisons, in degrees."""
+        code, angles = self.arm.get_servo_angle(is_radian=False)
+        joints = np.asarray(angles, dtype=float)
+        if code or joints.shape != (7,) or not np.isfinite(joints).all():
+            raise RuntimeError(f"현재 관절 조회 실패 (code={code})")
+        return joints
 
     def get_flange_pose(self):
         """T_base_flange (4x4, meters), with any TCP offset removed."""
@@ -63,10 +73,27 @@ class XArm7:
         return code == 0
 
     def enable_motion(self):
-        self.arm.motion_enable(enable=True)
-        self.arm.set_mode(0)
-        self.arm.set_state(0)
+        if self._motion_initialized:
+            # Subsequent cycles need a readiness check, not another enable/reset.
+            code, state = self.arm.get_state()
+            err_code, errors = self.arm.get_err_warn_code()
+            queue_code, pending = self.arm.get_cmdnum()
+            enabled = self.arm.motor_enable_states
+            if (code or err_code or queue_code or errors[0]
+                    or state not in (0, 2) or pending != 0
+                    or self.arm.mode != 0 or len(enabled) < 7
+                    or not all(enabled[:7])):
+                raise RuntimeError(
+                    f"로봇 준비 상태 변경 — 자동 재활성화하지 않습니다 "
+                    f"(state={state}, error={errors}, pending={pending})")
+            return
+        for command in (lambda: self.arm.motion_enable(enable=True),
+                        lambda: self.arm.set_mode(0), lambda: self.arm.set_state(0)):
+            code = command()
+            if code != 0:
+                raise RuntimeError(f"로봇 활성화 실패 (code={code})")
         time.sleep(0.5)
+        self._motion_initialized = True
 
     def move_tcp_linear(self, pose_mm_rad, speed_mm_s=30):
         """Slow straight-line TCP move. pose = [x,y,z (mm), r,p,y (rad)]."""

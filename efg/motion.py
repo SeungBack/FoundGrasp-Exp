@@ -4,16 +4,30 @@ import time
 import numpy as np
 
 from .robot import XArm7
+from .console import detail
 from .se3 import inv_se3, pose_delta, se3_to_xarm_pose
 
 
-def approach_blended(robot, T_pre, T_grasp, cfg, check=None, prepare=None):
+def _confirm_time(cfg, key):
+    """Require multiple stopped samples even when shortening endpoint dwell."""
+    value = float(cfg.get(key, .2))
+    if not np.isfinite(value) or not .04 <= value <= 1.0:
+        raise RuntimeError(f"{key}는 0.04~1초 범위여야 합니다")
+    return value
+
+
+def approach_blended(robot, T_pre, T_grasp, cfg, check=None, prepare=None, metrics=None):
     """Queue a rounded pre-grasp and exact-stop grasp; monitor until arrival.
 
     Camera exceptions propagate after stopping the controller (including its
     queued approach). Controller failures return False, without clearing errors.
     """
+    started = time.perf_counter()
+    width_s = 0.
+    if metrics is not None:
+        metrics.clear()
     try:
+        confirm_s = _confirm_time(cfg, "approach_confirm_s")
         if check:
             check()
         start, _ = robot.get_tcp_pose()
@@ -41,9 +55,12 @@ def approach_blended(robot, T_pre, T_grasp, cfg, check=None, prepare=None):
             if index == 0 and prepare is not None:
                 # Controller travels to pre-grasp while the host adjusts width.
                 # Never enqueue the final approach before width verification.
+                width_started = time.perf_counter()
                 if not prepare():
                     raise RuntimeError("pre-grasp 이동 중 그리퍼 폭 조절 실패")
+                width_s = time.perf_counter() - width_started
 
+        queued_at = time.perf_counter()
         deadline = time.monotonic() + float(cfg.get("approach_timeout_s", 60))
         settled_since = None
         while time.monotonic() < deadline:
@@ -61,7 +78,13 @@ def approach_blended(robot, T_pre, T_grasp, cfg, check=None, prepare=None):
             if state == 2 and pending == 0 and pos <= 0.002 and rot <= 1.0:
                 if settled_since is None:
                     settled_since = time.monotonic()
-                if time.monotonic() - settled_since >= 0.2:
+                confirmed_s = time.monotonic() - settled_since
+                if confirmed_s >= confirm_s:
+                    if metrics is not None:
+                        metrics.update(width_s=width_s,
+                                       confirm_s=confirmed_s,
+                                       before_queue_s=queued_at - started,
+                                       after_queue_s=time.perf_counter() - queued_at)
                     return True
             else:
                 settled_since = None
@@ -80,8 +103,10 @@ def approach_blended(robot, T_pre, T_grasp, cfg, check=None, prepare=None):
         raise
 
 
-def transfer_waypoint(T_pre, T_lift, drop_cfg, R_home_tcp):
-    """After retreat to pre-grasp, rise at fixed XY toward measured home orientation."""
+def transfer_waypoint(T_pre, T_lift, drop_cfg, R_home_tcp, closing_sign=1):
+    """Rise at fixed XY toward home or its tool-z half-turn equivalent."""
+    if closing_sign not in (1, -1):
+        raise RuntimeError("잘못된 상승 대칭 방향")
     radius = float(drop_cfg.get("transfer_clearance_margin_mm",
                                 drop_cfg.get("lift_blend_radius_mm", 10)))
     if not np.isfinite(radius) or radius <= 0:
@@ -94,7 +119,7 @@ def transfer_waypoint(T_pre, T_lift, drop_cfg, R_home_tcp):
                     float(T_pre[2, 3]) + .05)
     radius = min(radius, (clearance - T_pre[2, 3]) * 1000 * .25)
     target[2, 3] = clearance + radius / 1000
-    target[:3, :3] = rotation
+    target[:3, :3] = rotation @ np.diag([closing_sign, closing_sign, 1.])
     return target, radius
 
 
@@ -117,8 +142,9 @@ def reorientation_speed(T_start, T_end, cfg):
     return speed, angle
 
 
-def wait_tcp_stopped(robot, target, timeout_s, check=None):
+def wait_tcp_stopped(robot, target, timeout_s, check=None, confirm_s=.2):
     """Barrier between Cartesian and joint motion: no later command is queued."""
+    confirm_s = _confirm_time({"confirm_s": confirm_s}, "confirm_s")
     deadline = time.monotonic() + timeout_s
     settled_since = None
     while time.monotonic() < deadline:
@@ -135,42 +161,65 @@ def wait_tcp_stopped(robot, target, timeout_s, check=None):
         if state == 2 and pending == 0 and distance <= .002 and angle <= 1:
             if settled_since is None:
                 settled_since = time.monotonic()
-            if time.monotonic() - settled_since >= .2:
-                return
+            confirmed_s = time.monotonic() - settled_since
+            if confirmed_s >= confirm_s:
+                return confirmed_s
         else:
             settled_since = None
         time.sleep(.02)
     raise RuntimeError("상승 정지/목표 도착 확인 시간 초과 — 조인트 이송 미전송")
 
 
-def lift_and_transfer_blended(robot, T_pre, T_lift, robot_cfg, drop_cfg, check=None):
+def lift_and_transfer_blended(robot, T_pre, T_lift, robot_cfg, drop_cfg, check=None,
+                              on_stage=None, metrics=None, transfer_sign=1,
+                              j7_limits=None):
     """Retreat to pre-grasp, rise while adopting home orientation, then transfer.
 
     Plan before enqueueing. Never retry via another route after partial enqueue.
     Cartesian retreat/rise can blend; joint transfer starts only after a verified stop.
     """
+    if metrics is not None:
+        metrics.clear()
     try:
+        upper_confirm_s = _confirm_time(drop_cfg, "transfer_confirm_s")
+        release_confirm_s = _confirm_time(drop_cfg, "arrival_confirm_s")
         if check:
             check()
         current, _ = robot.get_tcp_pose()
-        target, radius = transfer_waypoint(T_pre, T_lift, drop_cfg, robot.R_home_tcp)
+        target, radius = transfer_waypoint(
+            T_pre, T_lift, drop_cfg, robot.R_home_tcp, closing_sign=transfer_sign)
         if T_pre[2, 3] <= current[2, 3]:
             raise RuntimeError("after-grasp 복귀 목표가 현재 위치보다 높지 않습니다")
-        retreat_radius = min(5.0, np.linalg.norm(T_pre[:3, 3] - current[:3, 3]) * 250,
+        retreat_radius = float(robot_cfg.get("retreat_blend_radius_mm", 5))
+        if not np.isfinite(retreat_radius) or retreat_radius < 0:
+            raise RuntimeError("잘못된 복귀 블렌딩 반경")
+        retreat_radius = min(retreat_radius, np.linalg.norm(T_pre[:3, 3] - current[:3, 3]) * 250,
                              (target[2, 3] - T_pre[2, 3]) * 250)
+        retreat_radius = retreat_radius if retreat_radius > .01 else -1
         # Validate the raised waypoint before moving a held object.
         if not all(robot.check_flange_ik(T @ inv_se3(robot.T_flange_tcp))
                    for T in (T_pre, target)):
             raise RuntimeError("상승 경유점 IK 실패")
+        if j7_limits is not None:
+            for T in (T_pre, target):
+                angles = robot.flange_ik_joints_deg(T @ inv_se3(robot.T_flange_tcp))
+                if (angles is None or len(angles) != 7 or not np.isfinite(angles).all()
+                        or not j7_limits[0] <= angles[6] <= j7_limits[1]):
+                    raise RuntimeError("상승 경유점 J7 제한/IK 재검사 실패")
         joints = np.asarray(drop_cfg["joints_deg"], dtype=float)
         if joints.shape != (7,) or not np.isfinite(joints).all():
             raise RuntimeError("잘못된 릴리즈 관절 목표")
+        joint_acc = float(drop_cfg.get("joint_acc_deg_s2", 50))
+        if not np.isfinite(joint_acc) or joint_acc <= 0:
+            raise RuntimeError("drop.joint_acc_deg_s2는 유한한 양수여야 합니다")
         rise_speed, angle = reorientation_speed(T_pre, target, robot_cfg)
         retreat_speed = min(float(robot_cfg["lift_speed_mm_s"]),
                             float(robot_cfg.get("retreat_speed_mm_s", 150)))
         joint_speed = float(drop_cfg["joint_speed_deg_s"])
-        print(f"  복귀 {retreat_speed:.0f}mm/s → 자세 전환 {rise_speed:.1f}mm/s "
-              f"(TCP 회전 {angle:.1f}°) → 정지 확인 → 이송 {joint_speed:.0f}°/s")
+        detail(f"복귀 {retreat_speed:.0f}mm/s → 자세 전환 {rise_speed:.1f}mm/s "
+              f"(TCP 회전 {angle:.1f}°, 상승 대칭 {transfer_sign:+d}) "
+              f"→ 정지 확인 → 이송 {joint_speed:.0f}°/s")
+        rise_started = time.perf_counter()
         for waypoint, blend, speed, acc in (
             (T_pre, retreat_radius, retreat_speed, robot_cfg.get("lift_acc_mm_s2", 500)),
             (target, -1, rise_speed, robot_cfg.get("reorient_acc_mm_s2", 150)),
@@ -182,13 +231,20 @@ def lift_and_transfer_blended(robot, T_pre, T_lift, robot_cfg, drop_cfg, check=N
                 radius=blend, is_radian=True, wait=False)
             if code:
                 raise RuntimeError(f"상승 명령 거부 (code={code})")
-        wait_tcp_stopped(robot, target, float(drop_cfg.get("transfer_timeout_s", 60)), check)
-        print("  상승 도착·정지 확인 완료 — 조인트 이송 시작 (혼합 블렌딩 없음)")
+        upper_confirmed = wait_tcp_stopped(
+            robot, target, float(drop_cfg.get("transfer_timeout_s", 60)), check,
+            confirm_s=upper_confirm_s)
+        if metrics is not None:
+            metrics.update(upper_confirm_s=upper_confirmed,
+                           retreat_rise_s=time.perf_counter() - rise_started)
+        detail("상승 도착·정지 확인 완료 — 조인트 이송 시작 (혼합 블렌딩 없음)")
         if check:
             check()
+        if on_stage:
+            on_stage("Joint transfer")
         code = robot.arm.set_servo_angle(
             angle=joints.tolist(), speed=float(drop_cfg["joint_speed_deg_s"]),
-            mvacc=50.0, radius=-1, is_radian=False, wait=False)
+            mvacc=joint_acc, radius=-1, is_radian=False, wait=False)
         if code:
             raise RuntimeError(f"이송 명령 거부 (code={code})")
         deadline = time.monotonic() + float(drop_cfg.get("transfer_timeout_s", 60))
@@ -215,7 +271,10 @@ def lift_and_transfer_blended(robot, T_pre, T_lift, robot_cfg, drop_cfg, check=N
             if state == 2 and pending == 0 and arrived:
                 if settled_since is None:
                     settled_since = time.monotonic()
-                if time.monotonic() - settled_since >= .2:
+                confirmed_s = time.monotonic() - settled_since
+                if confirmed_s >= release_confirm_s:
+                    if metrics is not None:
+                        metrics["arrival_confirm_s"] = confirmed_s
                     return True
             else:
                 settled_since = None
@@ -244,9 +303,12 @@ def connect_robot(cfg):
 
 def go_home(robot, cfg):
     r = cfg["robot"]
+    acc = float(r.get("home_joint_acc_deg_s2", 50))
+    if not np.isfinite(acc) or acc <= 0:
+        raise ValueError("robot.home_joint_acc_deg_s2는 유한한 양수여야 합니다")
     robot.enable_motion()
     robot.move_joints(r["home_joints_deg"],
-                      speed_deg_s=r["home_joint_speed_deg_s"])
+                      speed_deg_s=r["home_joint_speed_deg_s"], acc_deg_s2=acc)
 
 
 def move_tcp(robot, T_base_tcp, speed_mm_s, arrive_tol_mm=10.0, acc_mm_s2=None):

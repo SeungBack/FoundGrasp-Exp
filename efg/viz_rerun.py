@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from .console import row
 from urllib.parse import urlencode
 
 import numpy as np
@@ -130,7 +131,7 @@ class RerunViz:
                                get(cfg, "rerun.server_memory_limit", "2GiB"))
             query = urlencode({"url": f"rerun+http://127.0.0.1:{grpc}/proxy"})
             self.viewer_url = f"http://127.0.0.1:{web}/?{query}"
-            print(f"rerun 웹 뷰어 (고정 주소): {self.viewer_url}")
+            row("Rerun", f"웹 뷰어 · {self.viewer_url}")
         elif viewer == "native":
             # rr.spawn reuses an existing listener; keep it separate from the
             # persistent web server so switching modes actually opens a window.
@@ -140,14 +141,14 @@ class RerunViz:
                 Path(rerun_cli.__file__).parent / ("rerun.exe" if os.name == "nt" else "rerun"))
             rr.spawn(port=grpc, connect=False, hide_welcome_screen=True,
                      executable_path=executable)
-            print("rerun 데스크톱 뷰어: 별도 창으로 실행")
+            row("Rerun", "데스크톱 뷰어 · 별도 창")
         if viewer in ("web", "native"):
             sinks.append(rr.GrpcSink(f"rerun+http://127.0.0.1:{grpc}/proxy"))
         if get(cfg, "rerun.save_rrd", True) and out_dir is not None:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
             self.rrd_path = Path(out_dir) / f"{run_name}.rrd"
             sinks.append(rr.FileSink(str(self.rrd_path)))
-            print(f"rerun 기록: {self.rrd_path}")
+            row("기록", str(self.rrd_path))
         blueprint = rrb.Blueprint(rrb.Horizontal(
             rrb.Tabs(
                 rrb.Spatial3DView(origin="world", name="Robot / scene"),

@@ -14,6 +14,7 @@
 import numpy as np
 
 from .paths import FOUNDGRASP_ROOT, add_vendor_paths, import_grasp_group
+from .console import detail
 
 def uses_standalone_foundgrasp(cfg):
     return cfg.get("detector", {}).get("name") == "foundgrasp"
@@ -57,6 +58,7 @@ def shared_filter(gg, depth_full, K, cfg):
         # Rejected zero-score grasps may survive upstream top-k; never execute them.
         rejected_score = int(np.count_nonzero(~(gg.scores > 0)))
         gg = _subset(gg, gg.scores > 0)
+    counts["score_ok"] = len(gg)
     if len(gg):
         limit = float(pp["max_open_m"])
         widths = np.asarray(gg.widths)
@@ -66,11 +68,11 @@ def shared_filter(gg, depth_full, K, cfg):
                                           return_counts=True)
             common = np.argsort(-frequency, kind="stable")[:6]
             summary = ", ".join(f"{values[i]:g}mm×{frequency[i]}" for i in common)
-            print(f"  폭 필터: 한계 {limit * 1000:g}mm, 초과/무효 {np.count_nonzero(~keep)}개, "
+            detail(f"폭 필터: 한계 {limit * 1000:g}mm, 초과/무효 {np.count_nonzero(~keep)}개, "
                   f"score 기각 {rejected_score}개 | 유효 score 후보 폭(빈도 상위): {summary}")
         gg = _subset(gg, keep)
     elif rejected_score:
-        print(f"  후보 필터: score 기각 {rejected_score}개 (폭 검사 전)")
+        detail(f"후보 필터: score 기각 {rejected_score}개 (폭 검사 전)")
     counts["width_ok"] = len(gg)
     cd = pp.get("collision") or {}
     if len(gg) and cd.get("enabled", True) and not uses_standalone_foundgrasp(cfg):

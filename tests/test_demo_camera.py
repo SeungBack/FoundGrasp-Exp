@@ -87,6 +87,21 @@ def test_unreachable_recovery_aborts_before_pick(setup_pick):
     p.move.assert_not_called()
 
 
+@pytest.mark.parametrize('bad_joints', [None, [0.] * 6 + [100.], [float('nan')] * 7])
+def test_rechecking_selected_symmetry_blocks_pick_if_ik_or_j7_changed(setup_pick, bad_joints):
+    p = setup_pick
+    p.cfg['selection'] = {'ik_check_per_candidate': True, 'j7_limit_deg': [-89, 90]}
+    p.selected.transfer_sign = -1
+    p.robot.flange_ik_joints_deg.side_effect = [[0.] * 7, [0.] * 7, bad_joints]
+    assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg, auto=True,
+                               stream=p.stream) == ('abort', '선정 경로 사전 IK/J7 재검사')
+    expected = np.diag([-1., -1., 1.])
+    np.testing.assert_array_equal(p.robot.flange_ik_joints_deg.call_args.args[0][:3, :3], expected)
+    p.robot.enable_motion.assert_not_called()
+    p.gripper.pre_open.assert_not_called()
+    p.gripper.grip.assert_not_called()
+
+
 def test_disconnect_during_enable_prevents_open_and_pregrasp(setup_pick):
     p = setup_pick
 
@@ -209,14 +224,18 @@ def test_auto_closes_only_after_approach_completes(setup_pick, monkeypatch):
 @pytest.mark.parametrize("arrived,opened", [(True, True), (True, False), (False, True)])
 def test_release_requires_completed_transfer(setup_pick, monkeypatch, arrived, opened):
     p = setup_pick
+    p.selected.transfer_sign = -1
     p.gripper.grip.return_value = True, 40.
-    p.gripper.open.return_value = opened
+    p.gripper.release.return_value = opened
     monkeypatch.setattr(demo, "approach_blended", Mock(return_value=True))
 
     def transfer(*args, **kwargs):
         p.gripper.grip.assert_called_once()
-        p.gripper.open.assert_not_called()
+        p.gripper.release.assert_not_called()
         kwargs["check"]()
+        assert kwargs['transfer_sign'] == -1
+        checked_pose = p.robot.check_flange_ik.call_args.args[0]
+        np.testing.assert_array_equal(checked_pose[:3, :3], np.diag([-1., -1., 1.]))
         return arrived
 
     monkeypatch.setattr(demo, "lift_and_transfer_blended", transfer)
@@ -224,19 +243,27 @@ def test_release_requires_completed_transfer(setup_pick, monkeypatch, arrived, o
                                 auto=True, stream=p.stream)
     if arrived:
         assert result == (("success", None) if opened else ("abort", "릴리즈 개방 실패"))
-        p.gripper.open.assert_called_once()
+        p.gripper.release.assert_called_once()
+        assert p.gripper.release.call_args.args == (p.selected.open_width_m,)
     else:
         assert result == ("abort", "상승/이송 이동")
-        p.gripper.open.assert_not_called()
+        p.gripper.release.assert_not_called()
     p.move.assert_not_called()
 
 
-@pytest.mark.parametrize("retry_mode", ["none", "empty", "selection", "exhausted"])
+@pytest.mark.parametrize("retry_mode", ["none", "empty", "selection", "exhausted",
+                                        "completed", "retry_completed", "motion_abort", "dryrun"])
 def test_run_cleans_up_camera_failure_without_exit_home(
         setup_pick, monkeypatch, tmp_path, capsys, retry_mode):
     from efg import gripper as gripper_module
 
     p = setup_pick
+    clock = [0.]
+    monkeypatch.setattr(demo.time, "perf_counter", lambda: clock[0])
+
+    def advance(seconds):
+        clock[0] += seconds
+
     cfg = p.cfg | {
         "_config_path": "mock.yaml", "scan_roi_px": [0, 0, 2, 2],
         "detector": {"name": "foundgrasp"},
@@ -249,12 +276,14 @@ def test_run_cleans_up_camera_failure_without_exit_home(
     grasps = [grasp]
     detector = Mock(last_refiner_ms=None)
     detector.detect.return_value = grasps
+    detector.detect.side_effect = lambda *a: advance(1.) or grasps
     detector.describe.return_value = "fake detector"
     viz = Mock()
     stop = Mock(requested=False)
     p.robot.get_flange_pose.return_value = np.eye(4), None
     p.gripper.connect.return_value = p.gripper
-    home = Mock()
+    home = Mock(side_effect=lambda *a: advance(2.))
+    p.stream.start.side_effect = lambda: advance(100.)  # excluded setup time
 
     monkeypatch.setattr(demo, "CameraStream", Mock(return_value=p.stream))
     monkeypatch.setattr(demo, "build_detector", Mock(return_value=detector))
@@ -284,7 +313,7 @@ def test_run_cleans_up_camera_failure_without_exit_home(
     monkeypatch.setattr(demo, "confirm", disconnect_and_accept)
     waits = Mock(return_value=False)
     monkeypatch.setattr(demo, "wait_user", waits)
-    if retry_mode in ("empty", "exhausted"):
+    if retry_mode in ("empty", "exhausted", "retry_completed"):
         count = [0]
         def filter_retry(*args):
             count[0] += 1
@@ -295,8 +324,34 @@ def test_run_cleans_up_camera_failure_without_exit_home(
         rejected = SimpleNamespace(selected=None, rejected=[(0, "IK")], summary=lambda: "IK")
         monkeypatch.setattr(demo, "select_grasp", Mock(side_effect=[
             rejected, rejected, SimpleNamespace(selected=p.selected, rejected=[])]))
-    stats = demo.run(cfg, auto=False)
+    if retry_mode in ("completed", "retry_completed", "motion_abort"):
+        def pick(*args, **kwargs):
+            advance(3.)
+            p.stream.quit_requested = True
+            return ("abort", "mock stop") if retry_mode == "motion_abort" else ("success", None)
+        monkeypatch.setattr(demo, "pick_and_place", pick)
+    if retry_mode == "dryrun":
+        monkeypatch.setattr(demo, "_home_flange_pose", lambda cfg: (np.eye(4), np.zeros(7)))
+    stats = demo.run(cfg, auto=False, dry_run=retry_mode == "dryrun")
+    if retry_mode in ("completed", "retry_completed", "motion_abort", "dryrun"):
+        output = capsys.readouterr().out
+        if retry_mode in ("completed", "retry_completed"):
+            seconds = 8 if retry_mode == "retry_completed" else 6
+            assert f"평균 {seconds:.2f}s" in output
+            assert "완료 1회" in output
+            assert stats["success"] == 1
+            # One result per cycle; final statistics repeat only the aggregate.
+            assert sum(line.lstrip().startswith("결과 ") for line in output.splitlines()) == 1
+        else:
+            assert "소요시간" in output
+            assert "완료 사이클 없음" in output
+            assert "평균" not in output
+            assert stats["success"] == 0
+        return
     if retry_mode == "exhausted":
+        output = capsys.readouterr().out
+        assert "소요시간" in output and "완료 사이클 없음" in output
+        assert "평균" not in output
         assert count[0] == 4
         assert p.stream.snapshot.call_count == 5  # warmup + 4 attempts
         waits.assert_called_once()
@@ -311,7 +366,9 @@ def test_run_cleans_up_camera_failure_without_exit_home(
 
 
     assert stats == {"cycles": 1, "success": 0, "fail": 0, "empty": 0}
-    assert "test camera disconnected" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "test camera disconnected" in output
+    assert "소요시간" in output and "완료 사이클 없음" in output
     home.assert_called_once_with(p.robot, cfg)  # initial scan home only
     assert_only_pregrasp(p)
     stop.restore.assert_called_once_with()

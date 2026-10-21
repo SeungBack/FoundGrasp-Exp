@@ -75,19 +75,22 @@ robot:
   # 스캔(홈) 자세 — 카메라가 박스 중심 상방에 수직으로 오도록
   # scripts/align_scan_pose.py(자동) 또는 teach_scan_pose.py(수동)로 갱신
   home_joints_deg: [-11.18, -22.16, -17.76, 77.08, -6.72, 98.24, -28.69]
-  home_joint_speed_deg_s: 126 # 조인트 최대 180 deg/s의 70%
-  travel_speed_mm_s: 700      # 홈 <-> pre-grasp 이동 (TCP 최대 1000 mm/s의 70%)
-  lift_speed_mm_s: 500
-  retreat_speed_mm_s: 700    # 파지 후 pre-grasp 복귀 속도 상한
-  reorient_speed_mm_s: 700   # 상승하며 홈 방향으로 손목 전환 시 병진 속도 상한
-  reorient_angular_speed_deg_s: 180 # 회전량/이동거리 기반 속도 산정 기준 (관절 속도 보장은 아님)
-  reorient_acc_mm_s2: 400    # 자세 전환 구간 가속도
-  lift_acc_mm_s2: 300         # 상승 시작/정지 가속도 명시 (SDK 이전 명령 값 상속 방지)
-  approach_speed_mm_s: 300    # pre-grasp -> grasp 접근: 저속·저가속 (접촉 충격 최소화)
-  approach_acc_mm_s2: 400     # 연속 pre-grasp/접근 명령의 가속도
-  pregrasp_blend_radius_mm: 5 # pre-grasp 통과 반경; 양쪽 구간 길이의 1/4 이하로 제한
+  home_joint_speed_deg_s: 180 # 홈 복귀 조인트 속도 (deg/s)
+  home_joint_acc_deg_s2: 300  # 홈 복귀 가속도 (deg/s²)
+  travel_speed_mm_s: 600     # 홈 -> pre-grasp 이동 속도 (mm/s)
+  lift_speed_mm_s: 600       # 복귀·자세 전환 공통 속도 상한 (mm/s)
+  retreat_speed_mm_s: 600    # 파지 후 pre-grasp 복귀 속도 상한
+  reorient_speed_mm_s: 650   # 상승하며 홈 방향으로 손목 전환 시 병진 속도 상한
+  reorient_angular_speed_deg_s: 300 # 회전량/이동거리 기반 속도 산정 기준 (관절 속도 보장은 아님)
+  reorient_acc_mm_s2: 700    # 자세 전환 구간 가속도
+  lift_acc_mm_s2: 700        # 파지 후 복귀 가속도 (물체를 든 상태)
+  approach_speed_mm_s: 400   # pre-grasp -> grasp 접근 속도 (mm/s)
+  approach_acc_mm_s2: 700    # 연속 pre-grasp/접근 명령의 가속도
+  pregrasp_blend_radius_mm: 10 # pre-grasp 통과 반경; 양쪽 구간 길이의 1/4 이하로 제한
+  retreat_blend_radius_mm: 10 # 복귀 -> 상승 경유점 통과 반경; 길이의 1/4 이하로 제한
+  approach_confirm_s: 0.05   # 파지점 도착·정지·빈 큐 연속 확인 시간 (0.04~1초)
   approach_timeout_s: 60     # 연속 접근 완료 대기 한도
-  default_acc_mm_s2: 5000     # --confirm 모드에서 접근 후 복원할 기본 가속도
+  default_acc_mm_s2: 1000     # --confirm 모드에서 접근 후 복원할 기본 가속도
   # tcp_payload: {weight_kg: 1.9, com_mm: [7, 1, 48]}   # 지정 시 연결마다 컨트롤러에 설정
 
 # ---------------------------------------------------------------- 카메라 (D435)
@@ -113,9 +116,14 @@ gripper:
   initialize_on_connect: false  # 반드시 false (위 운용 규칙)
   close_probe_on_connect: true  # 연결 시 close 방향 실측 점검 — 방향 손상 상태로 로봇이 움직이는 것 차단
   force_pct: 80               # 그립 힘 (50~100)
-  speed_pct: 100
-  close_min_wait_s: 0.3       # 닫힘 시작 확인 후 최소 대기; 연속 3회 위치 안정도 필요
-  open_min_wait_s: 0.15       # place 개방 최소 대기 (기존 1초); 실제 개방·연속 3회 정지 확인 유지
+  speed_pct: 100             # 그리퍼 API 속도 설정 상한 (100%)
+  close_min_wait_s: 0.05      # 닫힘 시작 확인 후 최소 대기; 연속 3회 위치 안정도 필요
+  open_min_wait_s: 0.05       # full 모드/연결 점검의 완전 개방 최소 대기; 도달·정지 확인 유지
+  pre_open_min_wait_s: 0.05   # pre-grasp 폭 조절 최소 대기 (기존 1초); 도달·정지 확인 유지
+  release_mode: width        # width: 놓을 폭까지만 확인 후 복귀 / full: 완전 개방·정착 대기
+  release_margin_mm: 5       # max(선정 개방 폭, 현재 파지 폭) + 여유 (전체 stroke 이하)
+  release_confirm_s: 0.05    # 기준 폭 이상을 유지하는 시간; 시간만으로 놓았다고 판정하지 않음
+  release_timeout_s: 5.0     # 릴리즈 폭 도달 대기 한도 (명령 시작 확인 이후)
   stroke_mm: 100.0            # 전체 스트로크. 팁 교체 시 실측 갱신
   pre_open_margin_mm: 0       # 개방 폭은 postprocess 규칙(1.2x)으로 정해지므로 추가 여유 없음
   grip_success_min_pct: 2.0   # close 후 finger 위치가 이보다 크면 파지 성공 (간격 판정).
@@ -132,11 +140,11 @@ selection:
   pre_grasp_offset_m: 0.10      # 접근 방향 반대로 물러난 pre-grasp 거리
   use_grasp_depth: true         # 검출기가 예측한 그립별 depth 반영
   approach_extra_m: 0.05        # 추가 삽입 여유 (m). 파지가 얕으면 키우고, 충돌하면 줄일 것
-  lift_height_m: 0.15           # 높은 이송 경유점의 최소 높이 = grasp z + 이 값
+  lift_height_m: 0.1           # 높은 이송 경유점의 최소 높이 = grasp z + 이 값
   ik_check_per_candidate: true
-  j7_limit_deg: [-89, 90]       # J7 허용 범위 — 179° 폭이라 closing_sign ± 중 한쪽만 통과 (케이블 꼬임 방지)
+  j7_limit_deg: [-89, 90]       # 파지·상승 대칭 후보 모두에 적용하는 J7 허용 범위 (케이블 꼬임 방지)
   camera_up:                    # 손목 카메라 하향 자세 배제 (바닥·박스 충돌 방지)
-    prefer: true                # closing_sign 두 해 중 카메라가 위로 가는 쪽 우선
+    prefer: true                # 카메라 하향 제한 적용; 경로 관절비용 동률이면 상향 우선
     max_down_deg: 20            # 카메라 측면 방향이 수평 아래로 이보다 기울면 탈락
 
 # ---------------------------------------------------------------- 작업 장면
@@ -146,9 +154,12 @@ scan_roi_px: [300, 11, 1093, 712]
 # 릴리즈(놓는 박스 상방) 자세 — scripts/teach_drop.py 로 티칭
 drop:
   joints_deg: [17.72, 7.1, 13.13, 82.38, -1.26, 76.13, 30.97]
-  joint_speed_deg_s: 180      # 파지 후 이송 속도 (상승 정지 확인 후 시작)
+  joint_speed_deg_s: 120      # 파지 후 이송 속도 (상승 정지 확인 후 시작)
+  joint_acc_deg_s2: 180       # 이송 가속도 (deg/s²)
   transfer_clearance_margin_mm: 10 # 높은 경유점 높이 여유; 여기서 정지 후 조인트 이송
   transfer_timeout_s: 60     # 상승/이송 완료 대기 한도
+  transfer_confirm_s: 0.10   # 상승 도착·정지·빈 큐 확인 후에만 조인트 이송 (0.04~1초)
+  arrival_confirm_s: 0.05    # 릴리즈 관절 목표 도착·정지·빈 큐 확인 시간 (0.04~1초)
   via_height_m: 0.35          # 이송 경유점 높이 (base z, m) — 박스 테두리보다 높게.
                               # pre-grasp 복귀 후 XY 고정 상승 + 홈 TCP 방향으로 회전
                               # max(grasp+lift_height, 이 값, pre-grasp+5cm) + 높이 여유
@@ -159,7 +170,7 @@ retry:
   exclude_radius_m: 0.02      # 직전 실패 그립 지점 반경 내 후보 제외 (base 좌표계)
 
 # ---------------------------------------------------------------- 파지 성공 판정
-# false면 판정 결과(finger 간격·페이로드 Δ)를 출력만 하고 실패 분기 없이 항상 이송.
+# false면 판정에 따른 실패 분기 없이 이송. finger 간격은 --verbose에서 확인.
 # 판정 기준을 실측으로 잡는 동안의 자료 수집용
 grip_check:
   enabled: false
@@ -200,4 +211,5 @@ rerun:
 
 output:
   dir: outputs
+  verbose: false             # true 또는 --verbose: refiner·필터·모션 상세 출력
   save_cycles: false          # true면 사이클별 후보/선정 오버레이 저장 (outputs/<실행이름>/cycleNNN_grasps.jpg)

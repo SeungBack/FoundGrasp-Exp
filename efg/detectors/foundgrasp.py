@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ..paths import FOUNDGRASP_ROOT, add_vendor_paths, import_grasp_group
 from .base import GraspDetector
+from ..console import detail
 
 # 논문 최종 레시피의 추론 설정 (Workspaces/FoundGrasp/docs/PLAN.md "Inference").
 # VERIFIER_SAMPLER: 원본 레시피는 triton 이지만 그 커널(scripts/verifier_sample.py)이
@@ -97,7 +98,7 @@ class FoundGraspDetector(GraspDetector):
         self.last_refiner_ms = self.impl.last_verifier_ms
         stats = getattr(self.refiner, "last_stats", None)
         if stats:
-            print(f"  refiner(NMS 전): 입력 {stats['input']} → 측정면 기각 {stats['surface_rejected']}, "
+            detail(f"refiner(NMS 전): 입력 {stats['input']} → 측정면 기각 {stats['surface_rejected']}, "
                   f"예산 제외 {stats['budget_skipped']}, 평가 {stats['evaluated']}, "
                   f"평가 후 0점 {stats['zero_after_network']}")
         return gg

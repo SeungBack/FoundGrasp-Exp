@@ -46,7 +46,7 @@ def test_standalone_skips_extra_collision_and_extra_width_margin(monkeypatch):
     monkeypatch.setattr(postprocess, "backproject", Mock(side_effect=AssertionError("extra CD")))
     result, counts = postprocess.shared_filter(gg, None, None, cfg)
     assert len(result) == 1
-    assert counts == {"detected": 3, "width_ok": 1, "collision_free": 1}
+    assert counts == {"detected": 3, "score_ok": 2, "width_ok": 1, "collision_free": 1}
     assert postprocess.open_width_m(.06, cfg) == pytest.approx(.06)
     cfg["detector"]["name"] = "economicgrasp"
     assert postprocess.open_width_m(.06, cfg) == pytest.approx(.072)

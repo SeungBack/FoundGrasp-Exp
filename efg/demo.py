@@ -3,7 +3,7 @@
   홈(스캔 자세) → 캡처 → 검출(detector.name) → 공유 후처리(폭 한계·충돌필터·정렬)
   → ROI 필터 → 선정(순위 순, IK·J7·카메라 상향·하강 제한)
   → pre-grasp 이동 중 그리퍼 폭 조절 → 완료 확인 → 접근 → 파지
-  → 성공: 상승 → 상방 경유(블렌딩) → 릴리즈 자세 → (페이로드 확인) → 놓기 → 반복
+  → 이송: 복귀·상승 → 상방 경유점 정지 확인 → 릴리즈 자세 → 놓기 → 반복
   → 실패: pre-grasp 복귀 → 홈 → 재스캔 (직전 실패 지점 반경 제외)
   ROI 내 후보 0개 → 대기, 사용자 입력(Enter 재개 / q 종료).
   제어된 종료(Ctrl+C 1회·q·취소) 시 홈 복귀. 이동 실패 abort는 그 자리 정지.
@@ -23,15 +23,17 @@ import numpy as np
 from .camera import CameraError, resolve_intrinsics
 from .camera_process import ProcessCameraStream as CameraStream
 from .config import get, require
+from . import console
 from .detectors import build_detector
 from .floor import FloorMap, clamp_to_floor
 from .motion import connect_robot, go_home, move_tcp, approach_blended, lift_and_transfer_blended, transfer_waypoint
 from .payload import load_payload_check
-from .postprocess import mask_depth_to_roi, shared_filter
+from .postprocess import mask_depth_to_roi, shared_filter, uses_standalone_foundgrasp
 from .roi import draw_overlay, exclude_near, filter_roi, project_px
-from .se3 import inv_se3
+from .se3 import inv_se3, pose_delta
 from .selection import select_grasp
 from .transforms import load_hand_eye
+from .timing import CycleTiming, TaktStats
 from .viz import draw_score_grippers, gripper_segments_px
 from .viz_rerun import RerunViz
 
@@ -89,14 +91,28 @@ def _payload_verdict(robot, payload):
 
 
 def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
-                   grip_check=True, stream=None, viz=None, stop=None):
+                   grip_check=True, stream=None, viz=None, stop=None, timing=None):
     """파지 → 릴리즈. 반환: ("success"|"fail"|"abort", 사유).
 
     fail: 파지 실패 (pre-grasp 복귀 완료 또는 릴리즈 자세, 재시도 가능).
     abort: 이동 실패/사용자 취소 — 충돌 가능성이 있으므로 그 자리에 정지.
-    grip_check=False: 판정 결과를 출력만 하고 항상 이송을 진행한다.
+    grip_check=False: 판정으로 분기하지 않고 이송한다. 핑거 위치는 상세 출력에서 확인.
     """
     def phase(name):
+        if timing is not None:
+            labels = {
+                "Pre-grasp / adjusting width / approach": "접근(폭 조절 병행)",
+                "Closing gripper": "파지 닫힘",
+                "Retreat / rise / stop / transfer": "복귀·상승",
+                "Joint transfer": "조인트 이송",
+                "At release pose": "릴리즈 준비",
+                "Releasing": "개방",
+                "Pre-grasp / opening": "pre-grasp(폭 조절 병행)",
+                "Waiting for approach confirmation": "사용자 확인",
+                "Approaching": "접근",
+                "Reopening / retracting": "실패 후 복귀",
+            }
+            timing.mark(labels.get(name, name))
         if viz is not None:
             viz.log_stage(name)
 
@@ -106,13 +122,28 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
         stream.raise_if_failed()
 
     # Also guard direct calls / disabled per-candidate IK before moving or closing.
-    T_transfer, _ = transfer_waypoint(sel.T_tcp_pre, sel.T_tcp_lift, d, robot.R_home_tcp)
+    transfer_sign = getattr(sel, "transfer_sign", 1)
+    T_transfer, _ = transfer_waypoint(
+        sel.T_tcp_pre, sel.T_tcp_lift, d, robot.R_home_tcp, closing_sign=transfer_sign)
     if not robot.check_flange_ik(T_transfer @ inv_se3(robot.T_flange_tcp)):
         print(f"  상승 경유점 사전 IK 실패: TCP {np.round(T_transfer[:3, 3] * 1000, 1).tolist()} mm")
         return "abort", "상승 경유점 사전 IK"
+    if cfg.get("selection", {}).get("ik_check_per_candidate", False):
+        lo, hi = cfg["selection"].get("j7_limit_deg", [-89., 90.])
+        # Floor clamping may have shifted the selected endpoints. Validate the
+        # chosen symmetry again before approaching or closing the gripper.
+        for T in (sel.T_tcp_pre, sel.T_tcp_grasp, T_transfer):
+            joints = robot.flange_ik_joints_deg(T @ inv_se3(robot.T_flange_tcp))
+            if (joints is None or len(joints) != 7 or not np.isfinite(joints).all()
+                    or not lo <= joints[6] <= hi):
+                return "abort", "선정 경로 사전 IK/J7 재검사"
+    if timing is not None:
+        angle = pose_delta(sel.T_tcp_pre, T_transfer)[1]
+        timing.notes.append(f"상승 방향 {'홈' if transfer_sign == 1 else '홈의 180° 대칭'} · "
+                            f"TCP 자세 전환 {angle:.1f}°")
 
     # 기본 모드에서는 pre-grasp 이동 중 폭 조절, 완료 확인 후 최종 접근한다.
-    # enable_motion은 내부 sleep(0.5s)+컨트롤러 왕복이 있어 반드시 먼저 끝내둔다.
+    # 최초 활성화 후에는 준비 상태만 확인하며 재활성화 대기를 반복하지 않는다.
     robot.enable_motion()
     if stream is not None:
         stream.raise_if_failed()
@@ -124,10 +155,20 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
                 raise RuntimeError("사용자 정지 요청")
 
         phase("Pre-grasp / adjusting width / approach")
+        approach_metrics = {}
         if not approach_blended(robot, sel.T_tcp_pre, sel.T_tcp_grasp,
                                 r, check=check_approach,
-                                prepare=lambda: gripper.pre_open(sel.open_width_m, check=check_approach)):
+                                prepare=lambda: gripper.pre_open(sel.open_width_m, check=check_approach),
+                                metrics=approach_metrics):
             return "abort", "연속 접근 이동"
+        if timing is not None and approach_metrics:
+            timing.notes.append(
+                f"접근 분해: 최종 명령 전 {approach_metrics['before_queue_s']:.2f}s · "
+                f"명령 후 도착 확인 {approach_metrics['after_queue_s']:.2f}s")
+            timing.notes.append(
+                f"폭 조절 {approach_metrics['width_s']:.2f}s는 이동과 병행 (위 시간에 포함)")
+            timing.notes.append(
+                f"파지점 도착 후 정지 확인 {approach_metrics['confirm_s']:.2f}s (접근에 포함)")
     else:
         res = {}
         t0 = time.monotonic()
@@ -142,7 +183,7 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
         moved = move_tcp(robot, sel.T_tcp_pre, r["travel_speed_mm_s"])
         t_move = time.monotonic() - t0
         opener.join(timeout=GRIPPER_OPEN_TIMEOUT_S)
-        print(f"  병행: 이동 {t_move:.1f}s / 개방 {res.get('t', float('nan')):.1f}s")
+        console.detail(f"병행: 이동 {t_move:.2f}s / 개방 {res.get('t', float('nan')):.2f}s")
         if opener.is_alive() or not res.get("ok"):
             return "abort", "그리퍼 개방"
         if not moved:
@@ -154,7 +195,7 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
             stream.raise_if_failed()
 
         phase("Approaching")
-        # 접근은 저속·저가속 — 물체 접촉 충격과 흔들림 최소화
+        # 확인 모드에서도 설정한 접근 가속도를 적용한다.
         acc = r.get("approach_acc_mm_s2")
         if acc:
             robot.arm.set_tcp_maxacc(float(acc))
@@ -170,8 +211,7 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
         check_approach()
     phase("Closing gripper")
     ok, pos = gripper.grip()
-    print(f"  파지: {'성공' if ok else '실패'} (finger {pos}%)"
-          + ("" if grip_check else " — 판정 미적용, 이송 진행"))
+    console.detail(f"닫힘: finger {pos}% · 판정 {'적용' if grip_check else '미적용'}")
     if not ok and grip_check:
         phase("Reopening / retracting")
         gripper.pre_open(sel.open_width_m)  # 완전 개방은 주변 물체와 충돌 위험
@@ -187,13 +227,22 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
         if stop is not None and stop.requested:
             raise RuntimeError("사용자 정지 요청")
 
+    transfer_metrics = {}
     if not lift_and_transfer_blended(robot, sel.T_tcp_pre, sel.T_tcp_lift, r, d,
-                                     check=check_transfer):
+                                     check=check_transfer, on_stage=phase,
+                                     metrics=transfer_metrics, transfer_sign=transfer_sign,
+                                     j7_limits=cfg.get("selection", {}).get("j7_limit_deg", [-89., 90.])):
         return "abort", "상승/이송 이동"
+    if timing is not None and transfer_metrics:
+        timing.notes.append(
+            f"복귀·상승 명령~완료 {transfer_metrics['retreat_rise_s']:.2f}s "
+            f"(정지 확인 {transfer_metrics['upper_confirm_s']:.2f}s 포함) · "
+            f"릴리즈 도착 확인 {transfer_metrics['arrival_confirm_s']:.2f}s (이송에 포함)")
 
     # 놓기 직전 페이로드 확인 (옵션) — 고정 자세의 관절 중력 토크를 빈 손 기준과
     # 비교. grip_check=False에서도 측정·출력은 유지 (임계값 실측 자료).
     phase("At release pose")
+    outcome = ("success", None)
     if payload is not None:
         has_obj, detail = _payload_verdict(robot, payload)
         if detail:
@@ -201,12 +250,11 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
                   f"{'물체 있음' if has_obj else '빈 손'}"
                   + ("" if grip_check else " (판정 미적용)"))
         if not has_obj and grip_check:
-            gripper.open()  # 다음 파지를 위해 개방 (릴리즈 상방이라 충돌 없음)
-            return "fail", "빈 손(페이로드)"
+            outcome = ("fail", "빈 손(페이로드)")
     phase("Releasing")
-    if not gripper.open():
+    if not gripper.release(sel.open_width_m, check=check_transfer):
         return "abort", "릴리즈 개방 실패"
-    return "success", None
+    return outcome
 
 
 def method_label(cfg):
@@ -245,6 +293,11 @@ def _home_flange_pose(cfg):
 
 
 def run(cfg, auto=True, dry_run=False):
+    with console.output_mode(bool(get(cfg, "output.verbose", False))):
+        return _run(cfg, auto=auto, dry_run=dry_run)
+
+
+def _run(cfg, auto=True, dry_run=False):
     """데모 루프 실행. 반환: stats dict."""
     from pathlib import Path
 
@@ -263,45 +316,67 @@ def run(cfg, auto=True, dry_run=False):
     live = bool(get(cfg, "live.enabled", False))
     mask_roi = bool(get(cfg, "postprocess.roi_depth_mask", True))
     grip_check = bool(get(cfg, "grip_check.enabled", True))
+    console.section("FoundGrasp · 실행 준비")
+    console.row("설정", cfg["_config_path"])
+    console.row("모드", "DRY-RUN · 로봇 이동 없음" if dry_run else (
+        "자동 실행" if auto else "접근 전 사용자 확인"))
+    console.row("측정", "홈 이동 시작 → 릴리즈 조건 충족 · 초기화/워밍업 제외")
     if not grip_check:
-        print("파지 성공 판정 미적용 — 판정 결과를 출력만 하고 항상 이송을 "
-              "진행합니다.\n  주의: 실패해도 재시도/실패 지점 제외가 동작하지 "
-              "않아, 잡히지 않는 물체에서 같은 시도를 반복할 수 있습니다 "
-              "(--auto 사용 시 특히).")
+        console.row("판정", "파지 판정 미적용 · 닫힘 완료 후 이송 · 파지 실패 기반 재시도 없음")
 
     # 빈 박스 하강 제한 (옵션) — dry-run은 실제 로봇 자세가 없어 미적용
     floor_map = None
     fl = cfg.get("floor_limit") or {}
     if fl.get("enabled", False) and not dry_run:
         floor_map = FloorMap.load(fl["map_path"])
-        print(f"하강 제한 활성: 높이맵 {floor_map.z.shape} "
-              f"(여유 {fl.get('clearance_m', 0.008) * 1000:.0f}mm)")
+        console.row("하강 제한", f"높이맵 {floor_map.z.shape} · "
+                    f"여유 {fl.get('clearance_m', 0.008) * 1000:.0f} mm")
 
     # 페이로드 확인 (옵션) — 판정 미적용 모드에선 기준값 미측정이 실행을 막지 않음
     payload = None
     if not dry_run:
         payload = load_payload_check(cfg, required=grip_check)
         if payload is not None:
-            print(f"페이로드 확인 활성: 임계 {payload.min_delta_nm:.3f} Nm "
+            console.row("페이로드", f"임계 {payload.min_delta_nm:.3f} Nm "
                   f"({'방향 투영' if payload.ref_delta is not None else '크기'} 기준)"
                   + ("" if grip_check else " — 출력만"))
 
     robot = gripper = stream = detector = viz = None
     stop = StopRequest()
     stats = {"cycles": 0, "success": 0, "fail": 0, "empty": 0}
+    takt = TaktStats()
+    cycle_timing = None
+
+    def finish_cycle(outcome, reason=None):
+        if cycle_timing is None or cycle_timing.finished:
+            return
+        seconds = cycle_timing.finish()
+        completed = outcome == "success" and not dry_run
+        if completed:
+            takt.add(seconds)
+        label = {"success": "이송 완료", "fail": "파지 판정에 따른 재시도",
+                 "abort": "중단", "no_candidate": "후보 없음", "preview": "미리보기 완료"}[outcome]
+        console.row("결과", label + (f" · {reason}" if reason else ""))
+        summary = cycle_timing.report(completed=completed, stats=takt)
+        if viz is not None:
+            viz.log_text(f"사이클 {stats['cycles']}: {label} · {summary}")
+
     home_on_exit = False  # 제어된 종료(q·취소 등)에서만 True — 예외 시 모션 금지
     try:
         viz = RerunViz(cfg, run_name, out_dir=Path(out_cfg.get("dir", "outputs")))
-        print("== 초기화: 카메라/검출기" + ("" if dry_run else "/로봇/그리퍼") + " ==")
+        console.row("연결", "카메라 / 검출기" + ("" if dry_run else " / 로봇 / 그리퍼"))
         stream = CameraStream(cfg, live=live)
         stream.start()
-        detector = build_detector(cfg)
-        print(f"검출기: {detector.describe()}")
+        console.row("모델", "로딩 중…")
+        with console.model_output(outdir / "model_init.log"):
+            detector = build_detector(cfg)
+        console.row("검출기", detector.describe())
+        console.row("모델 로그", str(outdir / "model_init.log"))
         viz.log_text(f"방법: {detector.describe()}  설정: {cfg['_config_path']}")
         warmup_runs = int(get(cfg, "detector.warmup_runs", 1))
         warm_rgb, warm_depth, warm_K = stream.snapshot()
         if warmup_runs > 0:
-            print(f"검출기 워밍업 {warmup_runs}회 (로봇 연결 전, 결과 미사용)")
+            console.row("워밍업", f"{warmup_runs}회 · 결과 미사용")
             warm_K = resolve_intrinsics(warm_K, cfg)
             if mask_roi:
                 warm_depth = mask_depth_to_roi(warm_depth, roi)
@@ -328,10 +403,11 @@ def run(cfg, auto=True, dry_run=False):
             if inference_retry == 0:
                 stats["cycles"] += 1
                 n = stats["cycles"]
+                scan_label = "DRY-RUN · 홈 자세 가정" if dry_run else "홈 → 파지 → 릴리즈"
+                console.section(f"CYCLE {n:03d}  |  {scan_label}")
+                cycle_timing = CycleTiming()
                 viz.set_cycle(n)
                 viz.log_stage("Homing" if not dry_run else "Home pose preview")
-                scan_label = "홈 자세 가정 (로봇 이동 없음)" if dry_run else "스캔 자세(홈)"
-                print(f"\n== 사이클 {n}: {scan_label} + 캡처 ==")
                 stream.set_status(f"CYCLE {n}: HOMING")
                 if robot is not None:
                     go_home(robot, cfg)
@@ -342,6 +418,7 @@ def run(cfg, auto=True, dry_run=False):
                     viz.log_robot(q_home)
                 T_base_cam = T_base_flange @ T_flange_cam
 
+            cycle_timing.mark("캡처·안정화")
             viz.log_stage("Scanning")
             stream.set_status(f"CYCLE {n}: SCANNING")
             stream.set_marks([])
@@ -355,6 +432,7 @@ def run(cfg, auto=True, dry_run=False):
             # ROI 밖(릴리즈 박스 더미)에 몰려 ROI 내 후보가 0개가 되는 것을 방지.
             # 무효 depth는 센서에서 늘 생기는 정상 입력이라 인공 표면을 만들지 않는다.
             depth_in = mask_depth_to_roi(depth_m, roi) if mask_roi else depth_m
+            cycle_timing.mark("추론·선정·시각화")
             viz.log_stage("Detecting / selecting")
             t0 = time.perf_counter()
             gg = detector.detect(rgb, depth_in, K)
@@ -366,10 +444,18 @@ def run(cfg, auto=True, dry_run=False):
             post_ms = (time.perf_counter() - post_t0) * 1000.0
             counts["roi"] = len(gg_roi)
             extra = getattr(detector, "last_refiner_ms", None)
-            print(f"  검출 {detect_ms:.0f}ms" + (f" (refiner {extra:.0f}ms)" if extra else "")
-                  + f" + 후처리 {post_ms:.0f}ms = {detect_ms + post_ms:.0f}ms"
-                  + f" | 후보 {counts['detected']} → 폭 {counts['width_ok']} → "
-                  f"충돌 {counts['collision_free']} → ROI {counts['roi']}")
+            console.row("검출", f"{detect_ms + post_ms:.0f} ms  |  추론 {detect_ms:.0f} ms"
+                        + (f" (refiner {extra:.0f} ms 포함)" if extra is not None else "")
+                        + f" · 후처리 {post_ms:.0f} ms")
+            candidates = (f"{counts['detected']} → score {counts.get('score_ok', counts['detected'])}"
+                          f" → 폭 {counts['width_ok']}")
+            if not uses_standalone_foundgrasp(cfg) and get(cfg, "postprocess.collision.enabled", True):
+                candidates += f" → 충돌 {counts['collision_free']}"
+            candidates += f" → ROI {counts['roi']}"
+            width_limit = get(cfg, "postprocess.max_open_m")
+            if width_limit is not None:
+                candidates += f"  |  폭 한계 {width_limit * 1000:g} mm"
+            console.row("후보", candidates)
             viz.log_scan(rgb, depth_m, K, T_base_cam, roi)
             viz.log_candidates(gg_roi, K, counts, detect_ms)
             viz.log_text(f"사이클 {n}: 검출 {detect_ms:.0f}ms + 후처리 {post_ms:.0f}ms, 후보 {counts}")
@@ -377,9 +463,9 @@ def run(cfg, auto=True, dry_run=False):
             if len(gg_roi) == 0:
                 if inference_retry < max_inference_retries:
                     inference_retry += 1
-                    print(f"  ROI 후보 없음 — 새 프레임 재추론 {inference_retry}/{max_inference_retries}")
+                    console.row("재추론", f"{inference_retry}/{max_inference_retries} · ROI 후보 없음 · 새 프레임")
                     continue
-                print(f"  {max_inference_retries + 1}회 추론에서 실행 후보를 확보하지 못했습니다.")
+                finish_cycle("no_candidate", f"추론 {max_inference_retries + 1}회 소진")
                 inference_retry = 0
                 stream.set_status("NO CANDIDATE - waiting user")
                 if not wait_user(stream, "재추론 한도 도달 — 장면 확인 후 재개하세요."):
@@ -423,14 +509,15 @@ def run(cfg, auto=True, dry_run=False):
                       f"{d_back * 1000:.0f}mm가 삽입 여유 초과, 재선정")
                 pool = exclude_near(pool, T_base_cam, [cand.p_base], 0.005)
             if s is None:
-                print(f"  실행 가능한 그립 없음 (탈락 {len(report.rejected)}건)")
-                print(report.summary())
+                console.row("선정", f"실행 가능한 그립 없음 · 탈락 {len(report.rejected)}건")
+                console.detail(report.summary())
                 viz.log_text(f"실행 가능한 그립 없음 (탈락 {len(report.rejected)}건)", level="WARN")
                 if inference_retry < max_inference_retries:
                     inference_retry += 1
-                    print(f"  선정 실패 — 새 프레임 재추론 {inference_retry}/{max_inference_retries}")
+                    console.row("재추론", f"{inference_retry}/{max_inference_retries} · 선정 실패 · 새 프레임")
                     continue
                 inference_retry = 0
+                finish_cycle("no_candidate", "재추론 한도 도달 · 실행 가능한 자세 없음")
                 if not wait_user(stream, "재추론 한도 도달 — 실행 가능한 자세가 없습니다."):
                     break
                 continue
@@ -455,19 +542,28 @@ def run(cfg, auto=True, dry_run=False):
             msg = (f"선정: 순위 {s.index + 1}/{len(pool)}, score {s.score:.6g}, "
                    f"폭 {s.width_m * 1000:.0f}mm → 개방 {s.open_width_m * 1000:.0f}mm, "
                    f"tilt {s.tilt_deg:.0f}°, 지점 {np.round(s.p_base * 1000, 1).tolist()} mm")
-            print("  " + msg)
+            console.row("선정", f"#{s.index + 1}/{len(pool)} · score {s.score:.6g} · "
+                        f"폭 {s.width_m * 1000:.0f} → 개방 {s.open_width_m * 1000:.0f} mm · "
+                        f"기울기 {s.tilt_deg:.0f}°")
+            console.row("목표", "  ".join(f"{axis} {value * 1000:.1f}" for axis, value in
+                                       zip("XYZ", s.p_base)) + " mm")
             viz.log_selected(g_one, s, K)
             viz.log_text(msg)
 
             if dry_run:
+                finish_cycle("preview")
                 viz.log_stage("Preview / waiting")
                 if not wait_user(stream, "[dry-run] 선정 완료."):
                     break
                 continue
 
+            cycle_timing.mark("모션 준비")
+            console.row("실행", "접근·폭 조절 → 닫힘 → 복귀·상승 → 이송 → 개방")
             outcome, reason = pick_and_place(robot, gripper, s, cfg, auto,
                                              payload=payload,
-                                             grip_check=grip_check, stream=stream, viz=viz, stop=stop)
+                                             grip_check=grip_check, stream=stream, viz=viz,
+                                             stop=stop, timing=cycle_timing)
+            finish_cycle(outcome, reason)
             viz.log_outcome(g_one, s, outcome, reason)
             if outcome == "abort":
                 if reason in ("사용자 취소", "그리퍼 개방"):  # 로봇 정상 상태
@@ -480,7 +576,6 @@ def run(cfg, auto=True, dry_run=False):
             if outcome == "success":
                 stats["success"] += 1
                 failed_pts, fail_streak = [], 0
-                print(f"  이적재 성공 (누적 {stats['success']})")
             else:
                 stats["fail"] += 1
                 fail_streak += 1
@@ -491,8 +586,7 @@ def run(cfg, auto=True, dry_run=False):
                     stats["empty"] += 1
                     print("  이송 후 빈 손 판정 — 파지 실패로 집계. "
                           "이송 중 낙하 여부를 확인하세요.")
-                print(f"  파지 실패({reason}) — 홈 복귀 후 재스캔 "
-                      f"(연속 {fail_streak}회)")
+                console.row("재시도", f"홈 복귀 후 재스캔 · 연속 {fail_streak}회")
                 if fail_streak >= cfg["retry"]["max_fail_streak"]:
                     if not wait_user(stream, "연속 파지 실패 — 장면 확인 후 재개하세요."):
                         break
@@ -500,10 +594,12 @@ def run(cfg, auto=True, dry_run=False):
         stream.raise_if_failed()
         home_on_exit = not unsafe_stop  # 루프의 정상 종료(break 포함)에서만 도달
     except CameraError as exc:
+        finish_cycle("abort", str(exc))
         print(f"\n[중단] {exc} — 추가 접근과 자동 홈 복귀를 수행하지 않습니다.")
         if viz is not None:
             viz.log_text(f"카메라 오류로 중단: {exc}", level="ERROR")
     finally:
+        finish_cycle("abort", "예외 또는 사용자 중단")
         stop.restore()
         if robot is not None and home_on_exit:
             try:
@@ -511,10 +607,10 @@ def run(cfg, auto=True, dry_run=False):
                 go_home(robot, cfg)
             except Exception as e:
                 print(f"홈 복귀 실패: {e} — 로봇 상태를 수동 확인하세요.")
-        print(f"\n== 종료: 사이클 {stats['cycles']}, "
-              f"성공 {stats['success']}, 실패 {stats['fail']}"
-              + (f" (그중 이송 후 빈 손 {stats['empty']})"
-                 if stats["empty"] else "") + " ==")
+        console.section("실행 종료")
+        console.row("누적", f"사이클 {stats['cycles']} · 이송 완료 {stats['success']}"
+                    + (f" · 파지 판정 재시도 {stats['fail']}" if grip_check else ""))
+        console.row("택타임", takt.summary())
         if viz is not None:
             viz.log_stage("Stopped")
             viz.log_text(f"실행 종료: 사이클 {stats['cycles']}")

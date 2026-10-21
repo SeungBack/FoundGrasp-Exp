@@ -6,6 +6,7 @@
 - 초기화 스윕 진행 중 연결 → 완료까지 대기
 """
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -183,8 +184,9 @@ def test_grip_success_and_empty(monkeypatch):
     assert not ok and pos == 0.0
 
 
-def test_close_minimum_wait_is_configurable(monkeypatch):
-    cfg = {"gripper": {**CFG["gripper"], "close_min_wait_s": .25}}
+@pytest.mark.parametrize("min_wait", [.15, .25])
+def test_close_minimum_wait_is_configurable(monkeypatch, min_wait):
+    cfg = {"gripper": {**CFG["gripper"], "close_min_wait_s": min_wait}}
     ctl, fake = make_ctl(monkeypatch, cfg=cfg)
     monkeypatch.setattr(ctl, "_move_cmd", lambda *a: True)
     waits = []
@@ -195,7 +197,7 @@ def test_close_minimum_wait_is_configurable(monkeypatch):
 
     monkeypatch.setattr(ctl, "_wait_settle", settle)
     assert ctl.grip() == (True, 30.)
-    assert waits == [.25]
+    assert waits == [min_wait]
 
 
 def test_unsettled_close_cannot_be_treated_as_success(monkeypatch):
@@ -229,14 +231,15 @@ def test_invalid_open_wait_rejected(monkeypatch, value):
         make_ctl(monkeypatch, cfg=cfg)
 
 
-def test_minimum_wait_does_not_bypass_position_stability(monkeypatch):
+@pytest.mark.parametrize("min_wait", [.15, .3])
+def test_minimum_wait_does_not_bypass_position_stability(monkeypatch, min_wait):
     ctl, _ = make_ctl(monkeypatch)
     clock = [0.]
     monkeypatch.setattr(gctl.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(gctl.time, "sleep", lambda dt: clock.__setitem__(0, clock[0] + dt))
     monkeypatch.setattr(ctl, "_read_status", lambda: FakeStatus(
         int(1000 - min(clock[0], .6) * 1000)))
-    ok, _ = ctl._wait_settle(min_wait_s=.3)
+    ok, _ = ctl._wait_settle(min_wait_s=min_wait)
     assert ok and clock[0] >= .75
 
 
@@ -277,9 +280,118 @@ def test_pre_open_uses_mm_margin(monkeypatch):
     assert ctl2.pre_open_margin_mm == 20.0
 
 
+@pytest.mark.parametrize("position,settled,expected", [
+    (500, True, True), (900, True, False), (500, False, False),
+])
+def test_short_pre_open_still_requires_width_and_settle(monkeypatch, position, settled, expected):
+    ctl, _ = make_ctl(monkeypatch)
+    monkeypatch.setattr(ctl, "_move_cmd", lambda *a, **kw: True)
+
+    def settle(**kwargs):
+        assert kwargs["min_wait_s"] == .15
+        assert kwargs["jam_protect"] is True
+        return settled, FakeStatus(position)
+
+    monkeypatch.setattr(ctl, "_wait_settle", settle)
+    assert ctl.pre_open(.04) is expected  # 40 mm + 10 mm margin
+
+
 def test_position_mode_and_invert(monkeypatch):
     cfg = {"gripper": dict(CFG["gripper"], grip_mode="position", invert=True)}
     ctl, fake = make_ctl(monkeypatch, cfg=cfg, pos=1000)
     # invert: 논리 개방(100%) == raw 0. 현재 raw 1000 = 논리 0%(닫힘)
     assert ctl.open()
     assert fake.pos == 0  # raw 0 = 논리 열림
+
+
+@pytest.fixture
+def release_clock(monkeypatch):
+    clock = [0.]
+    monkeypatch.setattr(gctl.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(gctl.time, "sleep", lambda dt: clock.__setitem__(0, clock[0] + dt))
+    return clock
+
+
+@pytest.mark.parametrize("invert", [False, True])
+def test_release_returns_before_fully_open_and_leaves_opening_active(monkeypatch, release_clock, invert):
+    cfg = {"gripper": {**CFG["gripper"], "invert": invert}}
+    ctl, fake = make_ctl(monkeypatch, cfg=cfg, pos=800 if invert else 200)
+    fake.stop = Mock(wraps=fake.stop)
+    assert ctl.release(.04)
+    pos = (1000 - fake.pos if invert else fake.pos) / 10
+    assert 44.5 <= pos < 100
+    assert fake.target == (0 if invert else 1000)
+    fake.stop.assert_not_called()
+    assert release_clock[0] >= .05
+
+
+def test_release_does_not_accept_current_grip_width_as_clearance(monkeypatch, release_clock):
+    ctl, _ = make_ctl(monkeypatch, pos=650)
+    monkeypatch.setattr(ctl, "_move_cmd", lambda *a, **kw: True)
+    monkeypatch.setattr(ctl, "_read_status", lambda: FakeStatus(650 if release_clock[0] < .1 else 700))
+    assert ctl.release(.04)  # actual 65 mm requires 70 mm, even though prediction is 40 mm
+    assert release_clock[0] >= .15
+
+
+def test_release_at_stroke_limit_tolerates_998_readback(monkeypatch, release_clock):
+    ctl, fake = make_ctl(monkeypatch, pos=200)
+    read = fake.read_status
+
+    def capped():
+        status = read()
+        status.finger_pos = min(status.finger_pos, 998)
+        return status
+
+    monkeypatch.setattr(fake, "read_status", capped)
+    assert ctl.release(.100)
+    assert fake.pos == 1000
+
+
+@pytest.mark.parametrize("failure", ["stuck", "jam", "fault", "missing", "reverse", "dead"])
+def test_failed_release_never_uses_timeout_as_success(monkeypatch, release_clock, failure):
+    ctl, fake = make_ctl(monkeypatch, pos=400, dead=failure == "dead")
+    fake.stop = Mock(wraps=fake.stop)
+    read = fake.read_status
+
+    def failing_status():
+        if fake.sent and failure in ("stuck", "jam"):
+            fake.target = 550
+        status = read()
+        if fake.sent:
+            if failure == "fault":
+                status.states |= 1 << 9
+            elif failure == "missing":
+                return None
+            elif failure == "jam":
+                status.motor_cur = 1200
+        return status
+
+    monkeypatch.setattr(fake, "read_status", failing_status)
+    if failure == "reverse":
+        monkeypatch.setattr(ctl, "_set_raw_open_pct", lambda pct: fake._accept_move(0) or True)
+    assert not ctl.release(.06)
+    fake.stop.assert_called_once()
+    assert fake.target == fake.pos
+
+
+def test_camera_error_during_release_stops_fingers_and_propagates(monkeypatch, release_clock):
+    from efg.camera import CameraError
+
+    ctl, fake = make_ctl(monkeypatch, pos=200)
+    fake.stop = Mock(wraps=fake.stop)
+
+    def check():
+        if fake.sent:
+            raise CameraError("release interrupted")
+
+    with pytest.raises(CameraError, match="release interrupted"):
+        ctl.release(.04, check=check)
+    fake.stop.assert_called_once()
+
+
+def test_full_release_mode_waits_for_original_open(monkeypatch):
+    cfg = {"gripper": {**CFG["gripper"], "release_mode": "full"}}
+    ctl, _ = make_ctl(monkeypatch, cfg=cfg)
+    monkeypatch.setattr(ctl, "open", Mock(return_value=False))
+    assert not ctl.release(.04)
+    ctl.open.assert_called_once()

@@ -27,11 +27,13 @@ def main():
     mode.add_argument("--confirm", action="store_true", help="pre-grasp에서 정지하고 접근 확인")
     ap.add_argument("--dry-run", action="store_true",
                     help="스캔·검출·선정만, 로봇/그리퍼 미사용")
+    ap.add_argument("--verbose", action="store_true",
+                    help="모델 초기화·refiner·필터·모션 진단 상세 출력")
     args = ap.parse_args()
 
     cfg = config_from_args(args)
-    print(f"설정: {cfg['_config_path']}"
-          + (f"  (+{len(args.set)}개 --set)" if args.set else ""))
+    if args.verbose:
+        cfg.setdefault("output", {})["verbose"] = True
 
     from efg.demo import run
     run(cfg, auto=not args.confirm, dry_run=args.dry_run)
