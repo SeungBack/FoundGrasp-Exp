@@ -80,6 +80,9 @@ def load_config(path=None, overrides=None):
     cfg_path = Path(path) if path else DEFAULT_CONFIG
     cfg = _load_yaml_chain(cfg_path)
     apply_overrides(cfg, overrides)
+    # Read K/D from the same calibration result as the flange-camera transform.
+    if get(cfg, "calib.intrinsics") == "hand_eye":
+        set_(cfg, "calib.intrinsics", get(cfg, "calib.hand_eye"))
     for key in PATH_KEYS:
         v = get(cfg, key)
         if v is not None:

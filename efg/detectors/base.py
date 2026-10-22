@@ -11,7 +11,7 @@
   - 방법 고유의 충돌검사는 포함한다 (논문 파이프라인의 일부: FoundGrasp refiner의
     측정면 검사 또는 점군 CD, RNGNet·HGGD·AnyGrasp 내장 CD).
   - 기본 FoundGrasp는 독립 detect()의 최종 NMS·top-50을 유지한다.
-    configs/benchmark.yaml은 두 방법의 외부 NMS·top-k를 끄고 공유 충돌 검사를 적용한다.
+    configs/benchmark.yaml도 FoundGrasp NMS·top-50 및 AnyGrasp NMS를 켜고 공유 충돌 검사를 적용한다.
   - ROI·하드웨어 폭 한계·IK는 실행 계층에서 적용한다.
 """
 from abc import ABC, abstractmethod

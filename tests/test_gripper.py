@@ -314,7 +314,9 @@ def release_clock(monkeypatch):
 
 @pytest.mark.parametrize("invert", [False, True])
 def test_release_returns_before_fully_open_and_leaves_opening_active(monkeypatch, release_clock, invert):
-    cfg = {"gripper": {**CFG["gripper"], "invert": invert}}
+    # Keep this early-return scenario independent of the production default:
+    # the fake advances 10% per read and reaches full opening within 0.1 s.
+    cfg = {"gripper": {**CFG["gripper"], "invert": invert, "release_confirm_s": .05}}
     ctl, fake = make_ctl(monkeypatch, cfg=cfg, pos=800 if invert else 200)
     fake.stop = Mock(wraps=fake.stop)
     assert ctl.release(.04)
@@ -395,3 +397,21 @@ def test_full_release_mode_waits_for_original_open(monkeypatch):
     monkeypatch.setattr(ctl, "open", Mock(return_value=False))
     assert not ctl.release(.04)
     ctl.open.assert_called_once()
+
+
+@pytest.mark.parametrize('raw,reason', [
+    (1001, '위치 판독 범위 오류'), (-1, '위치 판독 범위 오류'),
+    (float('nan'), '위치 판독 범위 오류'), (390, '닫힘 방향 이동 감지')])
+def test_release_reports_position_failure_values(monkeypatch, release_clock, capsys, raw, reason):
+    ctl, fake = make_ctl(monkeypatch, pos=400)
+    fake.stop = Mock(wraps=fake.stop)
+    readings = iter([FakeStatus(400), FakeStatus(raw)])
+    monkeypatch.setattr(ctl, '_read_status', lambda: next(readings))
+    monkeypatch.setattr(ctl, '_move_cmd', lambda *a, **kw: True)
+    assert not ctl.release(.06)
+    fake.stop.assert_called_once()
+    output = capsys.readouterr().out
+    assert reason in output
+    assert '시작 40.00%' in output
+    assert f'raw={raw}' in output
+    assert '명령 후' in output

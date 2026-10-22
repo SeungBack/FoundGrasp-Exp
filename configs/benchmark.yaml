@@ -6,12 +6,12 @@ base: default.yaml
 detector:
   name: anygrasp
   foundgrasp:
-    nms: false
-    top_k: 0
+    nms: true
+    top_k: 50
   anygrasp:
     args: [--sdk_dir, ~/Workspaces/anygrasp_sdk,
            --checkpoint, ~/Workspaces/anygrasp_sdk/ckpts/checkpoint_detection.tar,
-           --no-nms, --seed, '0', --gripper_height, '0.02']
+           --seed, '0', --gripper_height, '0.02']
 postprocess:
   protocol: common
   collision:

@@ -24,7 +24,8 @@ detector:
     refiner:
       enabled: true               # false = FoundGrasp-Base (detector only)
       weights: checkpoints/foundgrasp/G_V_dpt_fonly.pt   # RealSense 검출기용 refiner
-      env: {}                     # VERIFIER_* 덮어쓰기 (기본값은 efg/detectors/foundgrasp.py)
+      env:                        # VERIFIER_* 덮어쓰기 (기본값은 efg/detectors/foundgrasp.py)
+        VERIFIER_BODY: center     # 측정면 검사: 5mm 셀 중심이 몸체 내부일 때 검사 (overlap보다 덜 보수적)
   economicgrasp:
     conda_env: efg-economicgrasp
     script: ~/Workspaces/FoundGrasp/ext/EconomicGraspPrivate/sim_worker.py
@@ -67,8 +68,9 @@ postprocess:
 # (02.dev/hand_eye_calib 참조). intrinsics를 null로 두면 카메라 스트림 K 사용 —
 # hand-eye와 같은 K를 써야 역투영 좌표가 일관된다.
 calib:
-  hand_eye: configs/calib/hand_eye.yaml
-  intrinsics: configs/calib/intrinsics.yaml
+  hand_eye: /home/user/r_foundgrasp/02.dev/hand_eye_calib/outputs/hand_eye_latest.yaml
+  intrinsics: hand_eye        # 위 파일의 camera_intrinsics에서 K/D를 함께 읽음
+  undistort: true             # OpenCV 보정 K/D로 RGB·정렬 depth를 같은 pinhole 좌표계로 변환
 
 # ---------------------------------------------------------------- 로봇 (xArm7)
 # 전제: xArm Studio에 TCP offset = 그리퍼 끝, TCP payload = 그리퍼 질량 설정
@@ -121,12 +123,12 @@ gripper:
   close_probe_on_connect: true  # 연결 시 close 방향 실측 점검 — 방향 손상 상태로 로봇이 움직이는 것 차단
   force_pct: 80               # 그립 힘 (50~100)
   speed_pct: 100             # 그리퍼 API 속도 설정 상한 (100%)
-  close_min_wait_s: 0.05      # 닫힘 시작 확인 후 최소 대기; 연속 3회 위치 안정도 필요
-  open_min_wait_s: 0.05       # full 모드/연결 점검의 완전 개방 최소 대기; 도달·정지 확인 유지
-  pre_open_min_wait_s: 0.05   # pre-grasp 폭 조절 최소 대기 (기존 1초); 도달·정지 확인 유지
+  close_min_wait_s: 0.1      # 닫힘 시작 확인 후 최소 대기; 연속 3회 위치 안정도 필요
+  open_min_wait_s: 0.1       # full 모드/연결 점검의 완전 개방 최소 대기; 도달·정지 확인 유지
+  pre_open_min_wait_s: 0.1   # pre-grasp 폭 조절 최소 대기 (기존 1초); 도달·정지 확인 유지
   release_mode: width        # width: 놓을 폭까지만 확인 후 복귀 / full: 완전 개방·정착 대기
   release_margin_mm: 5       # max(선정 개방 폭, 현재 파지 폭) + 여유 (전체 stroke 이하)
-  release_confirm_s: 0.05    # 기준 폭 이상을 유지하는 시간; 시간만으로 놓았다고 판정하지 않음
+  release_confirm_s: 0.1    # 기준 폭 이상을 유지하는 시간; 시간만으로 놓았다고 판정하지 않음
   release_timeout_s: 5.0     # 릴리즈 폭 도달 대기 한도 (명령 시작 확인 이후)
   stroke_mm: 100.0            # 전체 스트로크. 팁 교체 시 실측 갱신
   pre_open_margin_mm: 0       # postprocess에서 배율 적용한 개방 폭에 더할 여유
@@ -143,7 +145,7 @@ selection:
   approach_max_tilt_deg: 25     # 접근 방향과 수직(base -z)의 최대 각도. 29°에서 self-collision 실측
   pre_grasp_offset_m: 0.10      # 접근 방향 반대로 물러난 pre-grasp 거리
   use_grasp_depth: true         # 검출기가 예측한 그립별 depth 반영
-  approach_extra_m: 0.05        # 추가 삽입 여유 (m). 파지가 얕으면 키우고, 충돌하면 줄일 것
+  approach_extra_m: 0.042        # 추가 삽입 여유 (m). 파지가 얕으면 키우고, 충돌하면 줄일 것
   lift_height_m: 0.1           # 높은 이송 경유점의 최소 높이 = grasp z + 이 값
   ik_check_per_candidate: true
   j7_limit_deg: [-89, 90]       # 파지·상승 대칭 후보 모두에 적용하는 J7 허용 범위 (케이블 꼬임 방지)
@@ -211,6 +213,7 @@ rerun:
   web_port: 9090              # 웹 고정 포트 — 터미널의 전체 URL을 북마크
   save_rrd: true
   max_candidates: 25         # 시각화만 제한 (검출·선정 후보 수는 유지)
+  point_radius_m: 0.0005     # 점군 점 반지름 0.5mm (기존 1.5mm)
   tcp_offset_m: 0.215         # 그리퍼 그림용 (xArm Studio TCP offset과 같게)
 
 output:

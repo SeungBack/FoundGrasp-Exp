@@ -1,7 +1,9 @@
 """RealSense D435 캡처 + 라이브 스트림 스레드.
 
 반환 규격: color RGB uint8 (H,W,3) / depth float32 meters (H,W) /
-K (3,3) color 스트림 intrinsics. depth는 color에 정렬(align)된다.
+K (3,3) 출력 영상 intrinsics. depth는 color에 정렬(align)된다.
+from_config는 calib.undistort=true이면 공유 메모리/프리뷰 전에 RGB-D를 함께
+보정한다. 출력은 같은 크기·보정 K를 쓰는 pinhole 영상이며 광학 좌표축은 유지한다.
 depth 후처리(camera.postprocess): disparity→spatial→temporal→depth 체인,
 파라미터는 pyrealsense2 기본값 (temporal Holes Fill=3 포함 — 정지 직후
 캡처는 잔상이 섞일 수 있어 스캔 전 짧은 대기를 둔다).
@@ -20,8 +22,11 @@ class CameraError(RuntimeError):
 
 class D435:
     def __init__(self, width=1280, height=720, fps=30,
-                 postprocess=True, warmup_frames=15, frame_timeout_s=2.0):
+                 postprocess=True, warmup_frames=15, frame_timeout_s=2.0, calibration=None):
         import pyrealsense2 as rs
+        from .rgbd_geometry import RGBDCalibration
+
+        self.geometry = RGBDCalibration(calibration or {})
 
         self.frame_timeout_s = float(frame_timeout_s)
         if self.frame_timeout_s <= 0:
@@ -66,6 +71,7 @@ class D435:
     def from_config(cls, cfg, warmup_frames=None):
         c = cfg["camera"]
         return cls(c["width"], c["height"], c["fps"],
+                   calibration=cfg.get('calib', {}),
                    postprocess=c["postprocess"],
                    frame_timeout_s=c.get("frame_timeout_s", 2.0),
                    warmup_frames=(c["warmup_frames"] if warmup_frames is None
@@ -94,7 +100,7 @@ class D435:
         rgb = np.ascontiguousarray(bgr[:, :, ::-1])
         depth_m = (np.asanyarray(depth.get_data()).astype(np.float32)
                    * self.depth_scale)
-        return rgb, depth_m, self.K
+        return self.geometry.process(rgb, depth_m, self.K)
 
     def close(self):
         if not self._started:
@@ -131,18 +137,29 @@ def resolve_intrinsics(K_stream, cfg):
         print(f"경고: calib.intrinsics 파일 없음 ({path}) — 스트림 K 사용")
         return K_stream
     with open(path) as f:
-        K = np.asarray(yaml.safe_load(f)["K"], dtype=np.float32)
+        data = yaml.safe_load(f)
+        if 'T_flange_cam' in data:
+            data = data['camera_intrinsics']
+        K = np.asarray(data["K"], dtype=np.float32)
     detail(f"intrinsics: 캘리브레이션 K 사용 (fx {K[0, 0]:.1f}, {path.name})")
     return K
 
 
-def save_frame_npz(path, rgb, depth_m, K):
-    np.savez_compressed(path, rgb=rgb, depth_m=depth_m, K=K)
+def save_frame_npz(path, rgb, depth_m, K, *, rectified=False):
+    np.savez_compressed(path, rgb=rgb, depth_m=depth_m, K=K, rectified=bool(rectified))
 
 
-def load_frame_npz(path):
-    d = np.load(path)
-    return d["rgb"], d["depth_m"], d["K"]
+def load_frame_npz(path, cfg=None, *, with_metadata=False):
+    """Old unmarked files are raw. Rectified files retain their recorded K."""
+    with np.load(path, allow_pickle=False) as d:
+        frame = d['rgb'], d['depth_m'], d['K']
+        rectified = bool(d['rectified'].item()) if 'rectified' in d else False
+    if cfg is not None and not rectified:
+        from .rgbd_geometry import RGBDCalibration
+        geometry = RGBDCalibration(cfg.get('calib', {}))
+        frame = geometry.process(*frame)
+        rectified = geometry.rectified
+    return (*frame, {'rectified': rectified}) if with_metadata else frame
 
 
 class CameraStream(threading.Thread):

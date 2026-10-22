@@ -47,18 +47,18 @@ class GripperCtl:
         self.force_pct = float(g["force_pct"])
         self.speed_pct = float(g["speed_pct"])
         self.close_min_wait_s = float(g.get("close_min_wait_s", 0.3))
-        if not 0.05 <= self.close_min_wait_s <= 10.0:
-            raise ValueError("gripper.close_min_wait_s는 0.05~10초 범위여야 합니다")
-        self.open_min_wait_s = float(g.get("open_min_wait_s", 0.05))
-        if not 0.05 <= self.open_min_wait_s <= 10.0:
-            raise ValueError("gripper.open_min_wait_s는 0.05~10초 범위여야 합니다")
-        self.pre_open_min_wait_s = float(g.get("pre_open_min_wait_s", 0.05))
-        if not 0.05 <= self.pre_open_min_wait_s <= 10.0:
-            raise ValueError("gripper.pre_open_min_wait_s는 0.05~10초 범위여야 합니다")
+        if not 0.1 <= self.close_min_wait_s <= 10.0:
+            raise ValueError("gripper.close_min_wait_s는 0.1~10초 범위여야 합니다")
+        self.open_min_wait_s = float(g.get("open_min_wait_s", 0.1))
+        if not 0.1 <= self.open_min_wait_s <= 10.0:
+            raise ValueError("gripper.open_min_wait_s는 0.1~10초 범위여야 합니다")
+        self.pre_open_min_wait_s = float(g.get("pre_open_min_wait_s", 0.1))
+        if not 0.1 <= self.pre_open_min_wait_s <= 10.0:
+            raise ValueError("gripper.pre_open_min_wait_s는 0.1~10초 범위여야 합니다")
         self.stroke_mm = float(g["stroke_mm"])
         self.release_mode = g.get("release_mode", "width")
         self.release_margin_mm = float(g.get("release_margin_mm", 5.0))
-        self.release_confirm_s = float(g.get("release_confirm_s", 0.05))
+        self.release_confirm_s = float(g.get("release_confirm_s", 0.1))
         self.release_timeout_s = float(g.get("release_timeout_s", 5.0))
         if self.release_mode not in ("width", "full"):
             raise ValueError("gripper.release_mode는 width 또는 full이어야 합니다")
@@ -423,7 +423,8 @@ class GripperCtl:
                 return False
             start_pct = self._pos_pct(s)
             if not math.isfinite(start_pct) or not 0 <= start_pct <= 100:
-                print("경고: 릴리즈 시작 위치 판독 오류 — 복귀하지 않습니다")
+                print(f"경고: 릴리즈 시작 위치 판독 오류 — 복귀하지 않습니다 "
+                      f"(raw={s.finger_pos}, {self._fmt_status(s)})")
                 return False
             release_mm = min(self.stroke_mm, max(width_mm, start_pct * self.stroke_mm / 100)
                              + self.release_margin_mm)
@@ -431,6 +432,7 @@ class GripperCtl:
             # Fully open commonly reports 99.8%, not exactly 100%. Limit the
             # tolerance to 0.5 mm and 10% of the requested release margin.
             tolerance_pct = min(.5, self.release_margin_mm * .1) / self.stroke_mm * 100
+            command_started = time.monotonic()
             if not self._move_cmd(lambda: self._set_raw_open_pct(100.0),
                                   100.0, "릴리즈", check=check):
                 return False
@@ -447,7 +449,13 @@ class GripperCtl:
                 now = time.monotonic()
                 pct = self._pos_pct(s)
                 if not math.isfinite(pct) or not 0 <= pct <= 100 or pct < start_pct - .5:
-                    print("경고: 릴리즈 위치 오류/닫힘 방향 이동 — 복귀하지 않습니다")
+                    reason = ("위치 판독 범위 오류" if not math.isfinite(pct) or not 0 <= pct <= 100
+                              else "닫힘 방향 이동 감지")
+                    print(f"경고: 릴리즈 {reason} — 복귀하지 않습니다 "
+                          f"(시작 {start_pct:.2f}% → 현재 {pct:.2f}%, "
+                          f"변화 {pct - start_pct:+.2f}%p, raw={s.finger_pos}, "
+                          f"명령 후 {now - command_started:.3f}s, "
+                          f"invert={self.invert}, {self._fmt_status(s)})")
                     return False
                 if (last is not None and abs(s.finger_pos - last) <= MOVE_TOL_TICKS
                         and abs(s.motor_cur) > STALL_CURRENT_MA):

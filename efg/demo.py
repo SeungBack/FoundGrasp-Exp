@@ -20,7 +20,7 @@ import time
 import cv2
 import numpy as np
 
-from .camera import CameraError, resolve_intrinsics
+from .camera import CameraError
 from .camera_process import ProcessCameraStream as CameraStream
 from .config import get, require
 from . import console
@@ -323,6 +323,8 @@ def _run(cfg, auto=True, dry_run=False):
     console.row("모드", "DRY-RUN · 로봇 이동 없음" if dry_run else (
         "자동 실행" if auto else "접근 전 사용자 확인"))
     console.row("측정", "홈 이동 시작 → 릴리즈 조건 충족 · 초기화/워밍업 제외")
+    console.row("영상 좌표", "K/D 왜곡 보정 · RGB/depth/ROI 동일 좌표" if get(cfg, 'calib.undistort', False)
+                else "왜곡 보정 미적용")
     if not grip_check:
         console.row("판정", "파지 판정 미적용 · 닫힘 완료 후 이송 · 파지 실패 기반 재시도 없음")
 
@@ -381,7 +383,6 @@ def _run(cfg, auto=True, dry_run=False):
         warm_rgb, warm_depth, warm_K = stream.snapshot()
         if warmup_runs > 0:
             console.row("워밍업", f"{warmup_runs}회 · 결과 미사용")
-            warm_K = resolve_intrinsics(warm_K, cfg)
             if mask_roi:
                 warm_depth = mask_depth_to_roi(warm_depth, roi)
             for _ in range(warmup_runs):
@@ -430,7 +431,6 @@ def _run(cfg, auto=True, dry_run=False):
                 time.sleep(0.3)  # 정지 후 temporal filter 안정화
             rgb, depth_m, K = (stream.snapshot(fresh=True) if inference_retry
                                else stream.snapshot())
-            K = resolve_intrinsics(K, cfg)
 
             # 입력: ROI 밖 depth 무효화(0) — 전 방법 동일. 전체 프레임 추론 시 후보가
             # ROI 밖(릴리즈 박스 더미)에 몰려 ROI 내 후보가 0개가 되는 것을 방지.
@@ -442,7 +442,8 @@ def _run(cfg, auto=True, dry_run=False):
             detect_ms, post_ms = detection.detect_ms, detection.post_ms
             if save_cycles:
                 save_detection(outdir / f'cycle{n:03d}_attempt{inference_retry:02d}',
-                               rgb, depth_m, K, detection)
+                               rgb, depth_m, K, detection,
+                               rectified=bool(get(cfg, 'calib.undistort', False)))
             extra = getattr(detector, "last_refiner_ms", None)
             model_time = (f"추론 {detect_ms:.0f} ms" if detection.inference_ms is None else
                           f"워커 {detection.inference_ms:.0f} ms · 통신 포함 {detect_ms:.0f} ms")

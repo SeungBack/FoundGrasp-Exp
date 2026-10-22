@@ -301,7 +301,6 @@ def test_run_cleans_up_camera_failure_without_exit_home(
     monkeypatch.setattr(demo, "load_payload_check", Mock(return_value=None))
     monkeypatch.setattr(demo, "go_home", home)
     monkeypatch.setattr(demo.time, "sleep", Mock())
-    monkeypatch.setattr(demo, "resolve_intrinsics", lambda K, cfg: K)
     monkeypatch.setattr(perception, "shared_filter", Mock(return_value=(
         grasps, {"detected": 1, "width_ok": 1, "collision_free": 1})))
     monkeypatch.setattr(perception, "filter_roi", lambda gg, *args: gg)

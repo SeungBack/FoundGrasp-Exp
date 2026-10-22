@@ -85,3 +85,28 @@ def test_joint_read_uses_actual_degrees(ready_robot):
     ready_robot.arm.get_servo_angle.return_value = 0, [10.] * 7
     np.testing.assert_array_equal(ready_robot.get_joints_deg(), [10.] * 7)
     ready_robot.arm.get_servo_angle.assert_called_once_with(is_radian=False)
+
+
+def test_tcp_offset_is_removed_for_handeye_and_applied_once_for_commands(ready_robot):
+    from efg.se3 import xarm_pose_to_se3, se3_to_xarm_pose, inv_se3
+    from efg.transforms import grasp_to_base, tool_pose_from_grasp
+    from types import SimpleNamespace
+    robot = ready_robot
+    # Nonzero translation AND rotation expose wrong multiplication order.
+    robot.T_flange_tcp = xarm_pose_to_se3([3, -4, 223, .05, -.02, .1])
+    flange = xarm_pose_to_se3([400, -200, 450, 2.7, .2, -.5])
+    reported_tcp = flange @ robot.T_flange_tcp
+    robot.arm.get_position.return_value = 0, se3_to_xarm_pose(reported_tcp)
+    measured_flange, _ = robot.get_flange_pose()
+    np.testing.assert_allclose(measured_flange, flange, atol=1e-12)
+    handeye = xarm_pose_to_se3([130, -34, -37, .01, -.02, 1.56])
+    camera = measured_flange @ handeye
+    g = SimpleNamespace(rotation_matrix=np.eye(3), translation=np.array([.1, -.05, .5]))
+    R, p = grasp_to_base(camera, g)
+    target_tcp = tool_pose_from_grasp(R, p, -1, .035)
+    target_flange = target_tcp @ inv_se3(robot.T_flange_tcp)
+    robot.arm.set_position.return_value = 0
+    assert robot.move_flange(target_flange)
+    kwargs = robot.arm.set_position.call_args.kwargs
+    actual_command = xarm_pose_to_se3([kwargs[k] for k in ('x','y','z','roll','pitch','yaw')])
+    np.testing.assert_allclose(actual_command, target_tcp, atol=1e-12)

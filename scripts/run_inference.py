@@ -41,22 +41,24 @@ def main():
         cfg['scan_roi_px'] = None
     cfg['_offline'] = {'frame': args.npz, 'warmup': args.warmup, 'repeat': args.repeat}
 
-    from efg.camera import load_frame_npz, resolve_intrinsics, save_frame_npz
+    from efg.camera import load_frame_npz, save_frame_npz
     from efg.detectors import build_detector
 
     if args.live:
         from efg.camera import D435
         with D435.from_config(cfg) as cam:
             rgb, depth_m, K = cam.get_frame()
+            geometry = {'rectified': cam.geometry.rectified}
         if args.save_npz:
             Path(args.save_npz).parent.mkdir(parents=True, exist_ok=True)
-            save_frame_npz(args.save_npz, rgb, depth_m, K)
+            save_frame_npz(args.save_npz, rgb, depth_m, K, **geometry)
             print(f"프레임 저장: {args.save_npz}")
     elif args.npz:
-        rgb, depth_m, K = load_frame_npz(args.npz)
+        rgb, depth_m, K, geometry = load_frame_npz(args.npz, cfg, with_metadata=True)
     else:
         ap.error("--npz 또는 --live 중 하나가 필요합니다")
-    K = resolve_intrinsics(K, cfg)
+    cfg['_offline']['frame_geometry'] = geometry
+    print('영상 좌표: ' + ('왜곡 보정 완료 · 저장/보정 K 사용' if geometry['rectified'] else '왜곡 보정 미적용'))
 
     from efg.perception import detect_frame
     from efg.recording import write_manifest, save_detection
@@ -73,7 +75,7 @@ def main():
             result = detect_frame(det, rgb, depth_m, K, cfg, roi)
             results.append(result)
             if args.record_dir:
-                save_detection(Path(args.record_dir) / f"frame{index:03d}", rgb, depth_m, K, result)
+                save_detection(Path(args.record_dir) / f"frame{index:03d}", rgb, depth_m, K, result, **geometry)
     finally:
         det.close()
     gg, counts = result.grasps, result.counts

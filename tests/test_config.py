@@ -56,8 +56,10 @@ def test_detector_cli_alias_overrides_only_name():
         '--config', 'configs/benchmark.yaml', '--grasp-detector', 'foundgrasp'])
     cfg = config_from_args(args)
     assert cfg['detector']['name'] == 'foundgrasp'
-    assert cfg['detector']['foundgrasp']['top_k'] == 0
-    assert cfg['detector']['foundgrasp']['nms'] is False
+    assert cfg['detector']['foundgrasp']['top_k'] == 50
+    assert cfg['detector']['foundgrasp']['nms'] is True
+    assert '--no-nms' not in cfg['detector']['anygrasp']['args']
+    assert cfg['postprocess']['collision']['enabled'] is True
     assert cfg['robot'] == load_config()['robot']
     assert cfg['postprocess']['protocol'] == 'common'
 

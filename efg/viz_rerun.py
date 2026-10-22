@@ -326,7 +326,8 @@ class RerunViz:
         valid = d > 0
         pts = backproject(d, Ks)
         cols = rgb[::POINT_STRIDE, ::POINT_STRIDE][valid]
-        rr.log("world/camera/points", rr.Points3D(pts, colors=cols, radii=0.0015))
+        rr.log("world/camera/points", rr.Points3D(
+            pts, colors=cols, radii=float(get(self.cfg, "rerun.point_radius_m", 0.0005))))
         for p in ("world/camera/grasps", "world/camera/image/grasps", "world/targets"):
             rr.log(p, rr.Clear(recursive=True))
 

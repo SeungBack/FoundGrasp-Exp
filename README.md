@@ -97,7 +97,6 @@ python run.py --auto                 #    무인 연속 실행
 웹 모드에서는 아래 **동일한 주소**로 접속한다. 전체 링크를 북마크하면 된다.
 
 [Rerun 열기](http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy)
-
 웹 포트는 `rerun.web_port: 9090`, 데이터 포트는 `rerun.grpc_port: 9876`이다.
 `python run.py`가 서버를 시작하고, 다음 실행에서는 재사용한다. 실행이 끝나도 서버는
 남아 있으며 기록은 실행별로 분리된다. `/` 주소만 열면 데이터에 자동 연결되지 않을 수
@@ -124,6 +123,28 @@ Matplotlib `RdYlGn`으로 표시 후보의 점수 최저→최고를 빨강→�
 dry-run에서는 측정값이 없으므로 목표 폭 미리보기로 명시한다.
 
 ## 카메라 프로세스와 추론 초기화
+
+기본 `calib.hand_eye`는 캘리브레이션 프로젝트의 `outputs/hand_eye_latest.yaml`을
+직접 가리킨다. `calib.intrinsics: hand_eye`이면 같은 파일의 `camera_intrinsics`에서
+K/D를 읽는다. 새 캘리브레이션 저장 후 프로그램을 재시작하면 적용되며, 별도 복사는
+필요 없다. 다른 장비에서는 `calib.hand_eye` 경로를 수정한다. 파일이 없으면 오류로
+종료하며 과거 값으로 자동 대체하지 않는다. 기존 분리형 intrinsics YAML 경로도 지원한다.
+
+`calib.undistort: true`가 기본이다. RealSense color 정렬과 depth 필터 뒤에,
+캡처 프로세스에서 보정 K/D로 RGB·depth를 동일하게 remap한다. RGB는 선형 보간,
+depth는 최근접 보간(깊이 경계의 가짜 표면 방지), 영상 밖은 0이다. 출력 크기와 K는
+유지하고 광학 좌표축을 회전하지 않으므로 hand-eye 변환은 그대로 사용한다.
+추론·점군·Rerun·라이브 프리뷰·ROI 지정은 모두 이 보정 영상 좌표를 사용한다.
+기존 `scan_roi_px` 숫자는 유지되지만 영상 내용이 보정되므로 박스 경계를 확인한다.
+보정은 캐시된 맵을 재사용하며 크기 불일치·보정 파일 누락 시 조용히 우회하지 않는다.
+
+현재 K/D는 `calibrate_intrinsics.py`의 OpenCV 추정값이다. 이 스크립트가 복사한
+이전 RealSense `distortion.inverse_brown_conrady` 이름보다 생성 출처를 우선하여
+OpenCV 계수로 해석한다. 출처가 확인되지 않은 inverse-Brown 계수는 거부한다.
+새 NPZ에는 `rectified` 표시를 저장한다. `run_inference.py`는 예전 무표시 파일만
+보정하고, 이미 보정된 파일은 저장된 영상/K를 유지해 이중 보정을 막는다.
+`--set calib.undistort=false`는 기존 미보정 캡처 동작으로 돌아가는 옵션이며,
+이미 보정된 NPZ를 원본 영상으로 되돌리지는 않는다.
 
 `run.py`는 카메라 SDK의 생성·캡처·정렬·depth 필터·종료를 별도 프로세스에서 수행한다.
 메인 프로세스는 공유 메모리의 최신 RGBD 한 장만 복사한다. 캡처 시각 기준 2초 이상
@@ -192,7 +213,7 @@ output: {dir: outputs/tilt20, save_cycles: true}
 | 그룹 | 주요 항목 |
 |---|---|
 | `detector` | `name`(백엔드), `device`, `foundgrasp.{config, checkpoint, top_k, collision_detection}` |
-| `calib` | `hand_eye`(T_flange_cam), `intrinsics`(캘리브레이션 K — hand-eye와 동일해야 함) |
+| `calib` | `hand_eye`(T_flange_cam), `intrinsics`(캘리브레이션 K/D), `undistort`(RGB-D 왜곡 보정) |
 | `robot` | `ip`, `home_joints_deg`(스캔 자세), 이동·접근 속도/가속도 |
 | `camera` | 해상도·fps, `postprocess`(RealSense depth 필터) |
 | `gripper` | `port`(by-id 고정 경로), 힘/속도, `pre_open_margin_mm`, `grip_success_min_pct` |
@@ -253,8 +274,13 @@ EconomicGrasp/RNGNet은 이 프로토콜의 검증 대상에 아직 포함하지
 
 공통 설정은 같은 입력 ROI·실측 K·폭 한계·공유 충돌 검사(voxel 1cm, 접근 5cm,
 thresh 0.01)·ROI 필터·IK·대칭 선정·모션을 사용합니다. FoundGrasp의 최종 NMS/top-50과
-AnyGrasp 데모의 외부 NMS는 끄고, 각 모델의 내부 후보 생성·refiner/내장 CD는 유지합니다.
+AnyGrasp 데모의 외부 NMS를 켜고, 각 모델의 내부 후보 생성·refiner/내장 CD를 유지합니다.
 SDK 내부 처리는 비공개이므로 동일한 내부 후보 수를 보장하지 않습니다.
+실장비 설정은 refiner 측정면 검사에 `VERIFIER_BODY: center`를 사용합니다.
+5mm 격자 셀이 몸체에 조금만 걸쳐도 포함하는 원본 `overlap` 대신, 셀 중심이 몸체 안에
+있는 경우 검사합니다. 얇은 물체에서 격자 근사로 인한 과도한 기각을 줄이기 위한 변경이며,
+원본 판정을 재현하려면 `detector.foundgrasp.refiner.env.VERIFIER_BODY=overlap`으로 설정합니다.
+측정면 거리 2.5mm와 refiner 신경망·공유 충돌 검사는 유지합니다.
 공통 설정의 AnyGrasp 검사 높이는 기존 FoundGrasp 후보와 같은 20mm로 지정합니다.
 FoundGrasp 최종 폭은 그대로 실행하며, AnyGrasp는 SDK 출력 폭에
 `postprocess.open_multiplier`(기본 1.2)를 곱한 뒤 개방 한계로 제한합니다.

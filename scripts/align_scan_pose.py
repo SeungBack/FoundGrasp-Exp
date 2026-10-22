@@ -50,7 +50,7 @@ def main():
     cfg = config_from_args(args)
     roi = require(cfg, "scan_roi_px", "scripts/set_roi.py 로 스캔 영역을 지정하세요")
 
-    from efg.camera import D435, resolve_intrinsics
+    from efg.camera import D435
     from efg.motion import connect_robot, go_home
     from efg.se3 import inv_se3
     from efg.transforms import load_hand_eye
@@ -65,7 +65,6 @@ def main():
 
         with D435.from_config(cfg) as cam:
             _, depth_m, K = cam.get_frame()
-        K = resolve_intrinsics(K, cfg)
 
         # ROI 중심 픽셀 + ROI 유효 depth 중앙값 → 박스 중심(base)
         x1, y1, x2, y2 = [int(v) for v in roi]

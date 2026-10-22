@@ -50,7 +50,7 @@ def main():
             if key == ord("s"):
                 out = Path(cfg["output"]["dir"]) / time.strftime("preview_%Y%m%d_%H%M%S.npz")
                 out.parent.mkdir(parents=True, exist_ok=True)
-                save_frame_npz(str(out), rgb, depth_m, K)
+                save_frame_npz(str(out), rgb, depth_m, K, rectified=cam.geometry.rectified)
                 print(f"저장: {out}")
     cv2.destroyAllWindows()
 

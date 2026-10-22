@@ -38,7 +38,7 @@ def write_manifest(cfg, path, detector=None):
         'git_status': git('status', '--short'), 'driver_python': platform.python_version(),
         'source_sha256': {str(p.relative_to(PROJECT_ROOT)): file_digest(p) for p in sources},
         'calibration_sha256': {k: file_digest(resolve(v)) for k, v in cfg.get('calib', {}).items()
-                               if v and resolve(v).is_file()},
+                               if isinstance(v, (str, Path)) and v and resolve(v).is_file()},
         'checkpoint': str(checkpoint) if checkpoint else None,
         'checkpoint_sha256': file_digest(checkpoint) if checkpoint and checkpoint.is_file() else None,
         'width_semantics': 'required_opening_m' if name in ('foundgrasp', 'anygrasp') else 'raw_width_m',
@@ -61,10 +61,10 @@ def write_manifest(cfg, path, detector=None):
     path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + '\n')
 
 
-def save_detection(prefix, rgb, depth_m, K, detection):
+def save_detection(prefix, rgb, depth_m, K, detection, *, rectified=False):
     prefix = Path(prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(str(prefix) + '_frame.npz', rgb=rgb, depth_m=depth_m, K=K)
+    np.savez(str(prefix) + '_frame.npz', rgb=rgb, depth_m=depth_m, K=K, rectified=bool(rectified))
     np.save(str(prefix) + '_grasps.npy', detection.grasps.grasp_group_array)
     if detection.raw_grasps is not None:
         np.save(str(prefix) + '_raw_grasps.npy', detection.raw_grasps)
