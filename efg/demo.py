@@ -309,8 +309,9 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
     if plan.transfer_sign != transfer_sign:
         console.row("상승 계획", f"실측 자세에서 대칭 방향 변경 {transfer_sign:+d} → {plan.transfer_sign:+d}")
     if plan.speed_scale < 1:
-        console.row("상승 계획", f"속도 초과 사전 검사 대응 · 기본 계획 대비 속도 {plan.speed_scale:.0%}, "
-                    f"가속도 {plan.speed_scale ** 2:.0%}로 초기 경로 검사 통과")
+        console.row("상승 계획", f"속도 초과 사전 검사 대응 · 이번 검사 입력 명령 대비 속도 {plan.speed_scale:.0%}, "
+                    f"가속도 {plan.speed_scale ** 2:.0%} · "
+                    f"이송 명령 {plan.commands[-1].speed:g}°/s")
     if getattr(plan, "route_name", "configured") != "configured":
         console.row("상승 경로", f"{plan.route_name} · 이송 시작 Z {plan.upper[2, 3] * 1000:.0f} mm")
     if timing is not None:

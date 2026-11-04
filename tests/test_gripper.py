@@ -535,7 +535,7 @@ def test_release_reports_position_failure_values(monkeypatch, release_clock, cap
     assert '명령 후' in output
 
 
-@pytest.mark.parametrize('plateau,expected', [(98.9, True), (98.0, False)])
+@pytest.mark.parametrize('plateau,expected', [(98.9, True), (98.2, True), (98.0, True), (97.9, False)])
 def test_release_full_stroke_replays_measured_endpoint_plateau(
         monkeypatch, release_clock, capsys, plateau, expected):
     cfg = {"gripper": {**CFG["gripper"], "release_confirm_s": .2}}
@@ -557,8 +557,43 @@ def test_release_full_stroke_replays_measured_endpoint_plateau(
     else:
         fake.stop.assert_called_once()
         output = capsys.readouterr().out
-        assert '시간 초과' in output and '98.50mm' in output
-        assert '98.00mm' in output and '100mA' in output
+        assert '시간 초과' in output and '98.00mm' in output
+        assert '97.90mm' in output and '100mA' in output
+
+
+@pytest.mark.parametrize('invert', [False, True])
+def test_release_replays_268_to_982_mm_with_92ma(monkeypatch, release_clock, invert):
+    from efg.config import load_config
+    cfg = load_config()
+    cfg['gripper']['invert'] = invert
+    ctl, fake = make_ctl(monkeypatch, cfg=cfg, pos=732 if invert else 268)
+    fake.stop = Mock(wraps=fake.stop)
+
+    def read():
+        width = 26.8 + (98.2 - 26.8) * min(release_clock[0] / 1., 1.)
+        raw = round(width * 10)
+        fake.pos = 1000 - raw if invert else raw
+        return FakeStatus(fake.pos, motor_cur=92)
+
+    monkeypatch.setattr(fake, 'read_status', read)
+    assert ctl.release(.100)
+    assert 1. <= release_clock[0] < 1.3
+    assert fake.target == (0 if invert else 1000)
+    fake.stop.assert_not_called()
+
+
+def test_explicit_tighter_full_open_tolerance_is_preserved(monkeypatch, release_clock):
+    cfg = {'gripper': {**CFG['gripper'], 'release_full_open_tolerance_mm': 1.5}}
+    ctl, fake = make_ctl(monkeypatch, cfg=cfg, pos=268)
+    monkeypatch.setattr(fake, 'read_status', lambda: FakeStatus(982 if fake.sent else 268, motor_cur=92))
+    assert not ctl.release(.100)
+    assert release_clock[0] >= ctl.release_timeout_s
+
+
+def test_default_full_open_tolerance_scales_with_smaller_stroke(monkeypatch):
+    cfg = {'gripper': {**CFG['gripper'], 'stroke_mm': 80.}}
+    ctl, _ = make_ctl(monkeypatch, cfg=cfg)
+    assert ctl.release_full_open_tolerance_mm == pytest.approx(1.6)
 
 
 @pytest.mark.parametrize('invert', [False, True])
@@ -613,7 +648,7 @@ def test_full_stroke_plateau_with_high_current_is_not_clearance(
     fake.stop = Mock(wraps=fake.stop)
 
     def read():
-        fake.pos = 989 if fake.sent else 615
+        fake.pos = 982 if fake.sent else 615
         return FakeStatus(fake.pos, motor_cur=1300)
 
     monkeypatch.setattr(fake, 'read_status', read)
@@ -634,7 +669,7 @@ def test_failed_open_ack_cannot_release_even_if_already_near_full_stroke(
     fake.stop.assert_called_once()
 
 
-@pytest.mark.parametrize('start,expected', [(986, False), (998, True)])
+@pytest.mark.parametrize('start,expected', [(982, False), (986, False), (998, True)])
 def test_looser_full_stroke_tolerance_does_not_accept_unmoved_nearly_open_grip(
         monkeypatch, release_clock, start, expected):
     ctl, fake = make_ctl(monkeypatch, pos=start, dead=True)

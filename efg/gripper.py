@@ -65,7 +65,8 @@ class GripperCtl:
         self.release_margin_mm = float(g.get("release_margin_mm", 5.0))
         self.release_confirm_s = float(g.get("release_confirm_s", 0.1))
         self.release_timeout_s = float(g.get("release_timeout_s", 5.0))
-        self.release_full_open_tolerance_mm = float(g.get("release_full_open_tolerance_mm", 1.5))
+        self.release_full_open_tolerance_mm = float(g.get(
+            "release_full_open_tolerance_mm", min(2., self.stroke_mm * .02)))
         if self.release_mode not in ("width", "full"):
             raise ValueError("gripper.release_mode는 width 또는 full이어야 합니다")
         if not math.isfinite(self.stroke_mm) or self.stroke_mm <= 0:
@@ -444,7 +445,7 @@ class GripperCtl:
                 return False
             release_mm = min(self.stroke_mm, max(width_mm, start_pct * self.stroke_mm / 100)
                              + self.release_margin_mm)
-            # Full-stroke feedback can plateau at 98.9 mm on the 100 mm tool.
+            # Full-stroke feedback has plateaued at 98.2–98.9 mm on the 100 mm tool.
             # Keep the tighter clearance tolerance for all non-saturated targets.
             at_limit = release_mm == self.stroke_mm
             clearance_tolerance_mm = min(.5, self.release_margin_mm * .1)

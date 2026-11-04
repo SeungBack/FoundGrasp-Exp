@@ -131,7 +131,7 @@ gripper:
   release_margin_mm: 5       # max(선정 개방 폭, 현재 파지 폭) + 여유 (전체 stroke 이하)
   release_confirm_s: 0.1    # 기준 폭 이상을 유지하는 시간; 시간만으로 놓았다고 판정하지 않음
   release_timeout_s: 5.0     # 최초 개방 명령부터 폭 확인까지 전체 한도 (재전송 포함)
-  release_full_open_tolerance_mm: 1.5 # 100mm 끝단 판독 오차 허용; 일반 릴리즈 폭은 기존 엄격한 기준
+  release_full_open_tolerance_mm: 2.0 # 최대 개방만 98mm 이상 허용 (100mm 도구); 일반 목표 오차는 별도
   stroke_mm: 100.0            # 전체 스트로크. 팁 교체 시 실측 갱신
   tip_length_mm: 80.0         # 시각화용 교체형 팁 전체 길이 (끝단 패드 포함)
   pre_open_margin_mm: 0       # postprocess에서 배율 적용한 개방 폭에 더할 여유
