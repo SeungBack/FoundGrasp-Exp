@@ -36,8 +36,15 @@ def tcp_ik_joints(robot, T_tcp, label, j7_limits=None):
         reason = failure if isinstance(failure, str) else f'반환={q}'
         if isinstance(failure, str):
             code = re.search(r'SDK code=(-?\d+)', failure)
-            if code is None or int(code.group(1)) != 1:
+            # get_inverse_kinematics returns 10 (RET_IS_INVALID) when it has
+            # no valid result. This API status is distinct from a native motion
+            # preflight's code=1 + only_check_result=21 combination. Code 1 on
+            # an IK query means HAS_ERROR, not a geometric rejection.
+            if code is None or int(code.group(1)) != 10:
                 raise RuntimeError(f"IK 조회 실패 ({label}, {reason})")
+            # INVALID can take precedence over fault flags in the SDK reply.
+            # Never hide an actual controller fault behind an unavailable IK.
+            _require_stopped(robot)
         raise _PathIKError(f"IK 불가 ({label}, {reason})")
     if np.shape(q) != (7,) or not np.isfinite(q).all():
         raise RuntimeError(f"IK 관절 판독 오류 ({label}, 반환={q})")

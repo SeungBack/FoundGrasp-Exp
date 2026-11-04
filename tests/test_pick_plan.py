@@ -86,6 +86,46 @@ def test_native_c21_rejects_first_whole_route_and_selects_alternative_before_app
     assert_checks_only(s)
 
 
+def test_sdk_10_before_approach_selects_other_route_without_motion(scene):
+    s = scene
+
+    def ik(target):
+        s.robot.last_ik_failure = None
+        if np.isclose(target[2, 3], .36) and np.isclose(target[0, 3], .4):
+            s.robot.last_ik_failure = 'SDK code=10, TCP(mm/rad)=[400, -200, 360, 0, 0, 0]'
+            return None
+        return [0.] * 7
+
+    s.robot.flange_ik_joints_deg.side_effect = ik
+    plan = prepare(s)
+    assert plan.transfer_route.name == 'alternative'
+    assert len(s.arm.writes) == 5  # only the feasible route reaches native whole-chain checks
+    assert_checks_only(s)
+
+
+def test_all_sdk_10_results_before_approach_are_reselectable(scene):
+    scene.robot.flange_ik_joints_deg.return_value = None
+    scene.robot.last_ik_failure = 'SDK code=10, TCP=[...]'
+    with pytest.raises(PlanRejected, match='configured.*alternative'):
+        prepare(scene)
+    assert not scene.arm.writes
+    scene.robot.stop_motion.assert_not_called()
+
+
+def test_ik_invalid_result_with_real_fault_aborts_before_next_route(scene):
+    def invalid_with_fault(target):
+        scene.robot.last_ik_failure = 'SDK code=10, TCP=[...]'
+        scene.arm.errors = [31, 14]
+        return None
+
+    scene.robot.flange_ik_joints_deg.side_effect = invalid_with_fault
+    with pytest.raises(RuntimeError, match='정지 확인 실패') as caught:
+        prepare(scene)
+    assert not isinstance(caught.value, PlanRejected)
+    scene.robot.flange_ik_joints_deg.assert_called_once()
+    assert not scene.arm.writes
+
+
 def test_all_native_c21_routes_are_expected_candidate_rejection(scene):
     scene.arm.reject = lambda kind, args, kw: (
         (1, 21) if kind == 'cartesian' and args[2] == 360 else (0, 0))

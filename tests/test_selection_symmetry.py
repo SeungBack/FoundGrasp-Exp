@@ -106,6 +106,25 @@ def test_ik_transport_failure_is_not_reported_as_no_candidate(scene):
         scene.select()
 
 
+def test_sdk_10_at_grasp_selects_other_symmetry(scene):
+    scene.robot.arm = SimpleNamespace(
+        mode=0, get_state=lambda: (0, 2), get_cmdnum=lambda: (0, 0),
+        get_err_warn_code=lambda: (0, [0, 14]))
+    original = scene.robot.flange_ik_joints_deg
+
+    def ik(target):
+        scene.robot.last_ik_failure = None
+        if target[0, 0] > 0 and target[2, 3] < .15:
+            scene.robot.last_ik_failure = 'SDK code=10, TCP=[...]'
+            return None
+        return original(target)
+
+    scene.robot.flange_ik_joints_deg = ik
+    report = scene.select()
+    assert report.selected.closing_sign == -1
+    assert any('IK 불가' in reason for _, reason in report.rejected)
+
+
 def test_camera_down_limit_overrides_shorter_route(scene, monkeypatch):
     p = scene
     p.cfg['selection']['camera_up'] = {'prefer': True, 'max_down_deg': 20}

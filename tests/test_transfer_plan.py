@@ -101,8 +101,8 @@ def test_common_retreat_failure_cannot_be_repaired_by_upper_symmetry(scene):
 def test_failed_transfer_retains_original_sdk_ik_diagnostic(scene):
     scene.robot.flange_ik_joints_deg.side_effect = None
     scene.robot.flange_ik_joints_deg.return_value = None
-    scene.robot.last_ik_failure = 'SDK code=1, TCP(mm/rad)=[474, -317, 156, 0, 0, 0]'
-    with pytest.raises(RuntimeError, match='복귀 pre-grasp, SDK code=1, TCP'):
+    scene.robot.last_ik_failure = 'SDK code=10, TCP(mm/rad)=[474, -317, 156, 0, 0, 0]'
+    with pytest.raises(RuntimeError, match='복귀 pre-grasp, SDK code=10, TCP'):
         prepare(scene, allow_symmetry=True)
     assert_no_motion(scene)
 

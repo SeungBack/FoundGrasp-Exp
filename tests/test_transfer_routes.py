@@ -240,7 +240,7 @@ def test_camera_constraint_applies_to_interiors_even_if_both_endpoints_pass(scen
     assert_checks_only(s)
 
 
-@pytest.mark.parametrize('code', [-1, 3, 10])
+@pytest.mark.parametrize('code', [-1, 1, 3, 9, 11, 12])
 def test_ik_transport_failure_is_not_reported_as_geometric_rejection(scene, code):
     s = scene
     s.robot.flange_ik_joints_deg.side_effect = None
@@ -248,6 +248,61 @@ def test_ik_transport_failure_is_not_reported_as_geometric_rejection(scene, code
     s.robot.last_ik_failure = f'SDK code={code}, TCP=[...]'
     with pytest.raises(RuntimeError, match='IK 조회 실패'):
         route_path_error(s.robot, routes(s)[0], s.cfg)
+    assert_checks_only(s)
+
+
+def test_sdk_10_at_lower_height_searches_higher_route_without_motion(scene):
+    s = scene
+    s.lift[2, 3] = .20
+    s.drop.update(min_transfer_height_m=.25, height_search_step_m=.02)
+    s.arm.get_err_warn_code.return_value = 0, [0, 14]  # no-solution warning, no actual fault
+
+    def ik(target):
+        s.robot.last_ik_failure = None
+        if np.isclose(target[2, 3], .26):
+            s.robot.last_ik_failure = 'SDK code=10, TCP(mm/rad)=[454, -343, 260, -2.81, .11, .43]'
+            return None
+        return s.joints.copy()
+
+    s.robot.flange_ik_joints_deg.side_effect = ik
+    plan = prepare(s)
+    assert plan.route_name == 'level_1_configured'
+    assert plan.upper[2, 3] == pytest.approx(.28)
+    assert_checks_only(s)
+
+
+def test_all_sdk_10_routes_are_clean_plan_rejection(scene):
+    s = scene
+
+    def ik(target):
+        s.robot.last_ik_failure = None
+        if target[2, 3] > s.pre[2, 3] + .01:
+            s.robot.last_ik_failure = 'SDK code=10, TCP=[...]'
+            return None
+        return s.joints.copy()
+
+    s.robot.flange_ik_joints_deg.side_effect = ik
+    with pytest.raises(PlanRejected, match='SDK code=10'):
+        prepare(s)
+    assert not s.arm.writes
+    assert_checks_only(s)
+
+
+@pytest.mark.parametrize('fault', ['controller', 'state', 'read'])
+def test_sdk_10_does_not_hide_actual_fault_or_failed_state_query(scene, fault):
+    s = scene
+    s.robot.flange_ik_joints_deg.side_effect = None
+    s.robot.flange_ik_joints_deg.return_value = None
+    s.robot.last_ik_failure = 'SDK code=10, TCP=[...]'
+    if fault == 'controller':
+        s.arm.get_err_warn_code.return_value = 0, [31, 14]
+    elif fault == 'state':
+        s.arm.get_state.return_value = 0, 5
+    else:
+        s.arm.get_state.return_value = 3, 2
+    with pytest.raises(RuntimeError, match='정지 확인 실패'):
+        route_path_error(s.robot, routes(s)[0], s.cfg)
+    assert not s.arm.writes
     assert_checks_only(s)
 
 
