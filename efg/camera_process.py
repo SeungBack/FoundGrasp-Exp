@@ -162,6 +162,41 @@ class ProcessCameraStream:
                 raise CameraError(f"카메라 최초 프레임 대기 시간 초과 ({timeout:g}초)")
             time.sleep(0.02)
 
+    def preview_snapshot(self, *, after_sequence=0, stride=1):
+        """Best-effort latest frame for visualization, without waiting for capture.
+
+        Pixels, intrinsics and host capture time are copied under the same lock.
+        The timestamp follows RGB-D processing, not sensor exposure. This reader
+        never consumes the error pipe: the main control loop owns error delivery.
+        Busy, duplicate, stale or unavailable frames return None.
+        """
+        if (isinstance(stride, (bool, np.bool_))
+                or not isinstance(stride, (int, np.integer)) or stride <= 0):
+            raise ValueError("preview stride는 양의 정수여야 합니다")
+        if (not self._started or self._closed or self._error is not None
+                or not self._process.is_alive()):
+            return None
+        if not self._lock.acquire(False):
+            return None
+        try:
+            if (self._closed or self._error is not None
+                    or not self._process.is_alive()):
+                return None
+            sequence = self._sequence.value
+            captured_at = self._updated.value
+            if (sequence == 0 or sequence <= after_sequence
+                    or not np.isfinite(captured_at) or captured_at <= 0
+                    or time.monotonic() - captured_at > self._max_age):
+                return None
+            rgb, depth, K = self._arrays
+            rgb = rgb[::stride, ::stride].copy()
+            depth = depth[::stride, ::stride].copy()
+            K = K.copy()
+            K[:2] /= stride
+            return rgb, depth, K, captured_at, sequence
+        finally:
+            self._lock.release()
+
     def _send_overlay(self):
         if not self.live or self._closed:
             return

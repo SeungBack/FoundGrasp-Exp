@@ -28,14 +28,24 @@ def vertical_sel(tip_z):
 
 
 def test_above_surface_untouched():
-    sel, back = clamp_to_floor(vertical_sel(0.05), G(), flat_map(0.0), CFG)
+    original = vertical_sel(0.05)
+    original.j7_range_deg = (-20., 30.)
+    sel, back = clamp_to_floor(original, G(), flat_map(0.0), CFG)
     assert sel is not None and back == 0.0
     assert np.isclose(sel.T_tcp_grasp[2, 3], 0.05)
+    assert sel.j7_range_deg == original.j7_range_deg
 
 
 def test_below_surface_backs_off_to_clearance():
-    sel, back = clamp_to_floor(vertical_sel(0.0), G(), flat_map(0.0), CFG)
+    original = vertical_sel(0.0)
+    original.j7_range_deg = (-20., 30.)
+    original.pick_plan = "previously checked route"
+    sel, back = clamp_to_floor(original, G(), flat_map(0.0), CFG)
     assert sel is not None and np.isclose(back, 0.008, atol=1e-4)
+    assert sel.j7_range_deg is None
+    assert sel.pick_plan is None
+    assert original.pick_plan == "previously checked route"
+    assert original.j7_range_deg == (-20., 30.)
     assert np.isclose(sel.T_tcp_grasp[2, 3], 0.008, atol=1e-4)
     # pre/lift 자세도 같은 양만큼 함께 이동
     assert np.isclose(sel.T_tcp_pre[2, 3], 0.1 + 0.008, atol=1e-4)

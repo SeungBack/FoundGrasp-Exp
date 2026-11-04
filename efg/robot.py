@@ -19,6 +19,7 @@ class XArm7:
 
         self.arm = XArmAPI(ip, is_radian=True)
         self._motion_initialized = False
+        self._last_ik_failure = None
         self.arm.clean_warn()
         self.arm.clean_error()
 
@@ -34,6 +35,71 @@ class XArm7:
         if code != 0:
             raise RuntimeError(f"get_position failed (code={code})")
         return xarm_pose_to_se3(pose), [float(v) for v in pose]
+
+    def configure_tcp_offset(self, offset_mm_deg):
+        """Apply a measured tool frame while idle, then verify the SDK report.
+
+        Configuration uses mm/degrees; this wrapper's cached TCP frame uses
+        mm/radians. No movement, activation, error reset or persistent save is
+        performed here. A failed readback must prevent subsequent motion.
+        """
+        try:
+            requested = np.asarray(offset_mm_deg, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("robot.tcp_offset_mm_deg는 유한한 6개 값이어야 합니다") from exc
+        if requested.shape != (6,) or not np.isfinite(requested).all():
+            raise ValueError("robot.tcp_offset_mm_deg는 유한한 6개 값이어야 합니다")
+        radians = requested.copy()
+        radians[3:] = np.radians(radians[3:])
+        target = xarm_pose_to_se3(radians)
+
+        def require_idle():
+            state_code, state = self.arm.get_state()
+            queue_code, pending = self.arm.get_cmdnum()
+            error_code, errors = self.arm.get_err_warn_code()
+            if (state_code or queue_code or error_code or not errors or errors[0]
+                    or state not in (2, 4, 5) or pending != 0 or self.arm.mode != 0):
+                raise RuntimeError(
+                    f"TCP 설정 전/후 정지 상태 확인 실패 — 이동하지 않습니다 "
+                    f"(mode={self.arm.mode}, state={state}, error/warn={errors}, "
+                    f"pending={pending}, read_codes={[state_code, queue_code, error_code]})")
+
+        def read_offset():
+            try:
+                value = np.asarray(self.arm.tcp_offset, dtype=float)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("TCP offset 보고값 판독 오류") from exc
+            if value.shape != (6,) or not np.isfinite(value).all():
+                raise RuntimeError("TCP offset 보고값은 유한한 6개 값이어야 합니다")
+            return value.copy()
+
+        def matches(value):
+            distance, angle = pose_delta(xarm_pose_to_se3(value), target)
+            return distance <= 1e-5 and angle <= .001
+
+        require_idle()
+        actual = read_offset()
+        if not matches(actual):
+            # An explicit idle/empty-queue check precedes this setting command.
+            # Avoid SDK waiting on previously failed movement feedback.
+            code = self.arm.set_tcp_offset(requested.tolist(), is_radian=False, wait=False)
+            if code != 0:
+                raise RuntimeError(f"TCP offset 설정 실패 (code={code}) — 이동하지 않습니다")
+            deadline = time.monotonic() + 2.0
+            while True:
+                require_idle()
+                actual = read_offset()
+                if matches(actual):
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"TCP offset 설정 확인 시간 초과 — 이동하지 않습니다 "
+                        f"(요청 mm/deg={requested.tolist()}, 보고 mm/rad={actual.tolist()})")
+                time.sleep(.02)
+        require_idle()
+        self.tcp_offset = actual.tolist()
+        self.T_flange_tcp = xarm_pose_to_se3(actual)
+        row("TCP 설정", f"{requested.tolist()} mm/deg · 보고값 확인 완료")
 
     def get_joints_deg(self):
         """Read actual joint angles for motion-cost comparisons, in degrees."""
@@ -150,21 +216,36 @@ class XArm7:
             return True
         return code == 0
 
+    @property
+    def last_ik_failure(self):
+        """Diagnostic for the most recent IK query; None after a valid result."""
+        return getattr(self, "_last_ik_failure", None)
+
     def flange_ik_joints_deg(self, T_base_flange):
         """목표 플랜지 자세의 IK 관절해 (deg 리스트). 실패/미지원 시 None.
 
         관절 이동량 비교(예: 등가 자세 중 손목 회전 최소 선택)에 사용한다.
         시드는 현재 관절 자세(SDK 내부)이다.
         """
+        self._last_ik_failure = None
         pose = self._flange_to_tcp_pose(T_base_flange)
+        target = f"TCP(mm/rad)={np.round(pose, 6).tolist()}"
+        solve = getattr(self.arm, "get_inverse_kinematics", None)
+        if not callable(solve):
+            self._last_ik_failure = f"SDK IK API 미지원, {target}"
+            return None
+        code, angles = solve(pose, input_is_radian=True, return_is_radian=True)
+        if code != 0:
+            self._last_ik_failure = f"SDK code={code}, {target}"
+            return None
         try:
-            code, angles = self.arm.get_inverse_kinematics(
-                pose, input_is_radian=True, return_is_radian=True)
-        except AttributeError:
+            joints = np.asarray(angles, dtype=float)
+        except (TypeError, ValueError):
+            joints = np.empty(0)
+        if joints.shape != (7,) or not np.isfinite(joints).all():
+            self._last_ik_failure = f"SDK code={code}, 유한한 7개 관절각이 아님, {target}"
             return None
-        if code != 0 or angles is None:
-            return None
-        return [float(np.degrees(a)) for a in angles[:7]]
+        return np.degrees(joints).tolist()
 
     def move_flange(self, T_base_flange, speed_mm_s=60, acc_mm_s2=None):
         """플랜지를 목표 SE(3)로 직선 이동. 실패 시 예외 대신 False 반환."""

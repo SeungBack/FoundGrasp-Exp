@@ -3,7 +3,7 @@
   홈(스캔 자세) → 캡처 → 검출(detector.name) → 공유 후처리(폭 한계·충돌필터·정렬)
   → ROI 필터 → 선정(순위 순, IK·J7·카메라 상향·하강 제한)
   → pre-grasp 이동 중 그리퍼 폭 조절 → 완료 확인 → 접근 → 파지
-  → 이송: 복귀·상승 → 상방 경유점 정지 확인 → 릴리즈 자세 → 놓기 → 반복
+  → 이송: 복귀·상승 → 정지·이송 검사 → 조인트 이송 → 릴리즈 정지 확인 → 놓기 → 반복
   → 실패: pre-grasp 복귀 → 홈 → 재스캔 (직전 실패 지점 반경 제외)
   ROI 내 후보 0개 → 대기, 사용자 입력(Enter 재개 / q 종료).
   제어된 종료(Ctrl+C 1회·q·취소) 시 홈 복귀. 이동 실패 abort는 그 자리 정지.
@@ -26,15 +26,18 @@ from .config import get, require
 from . import console
 from .detectors import build_detector
 from .floor import FloorMap, clamp_to_floor
-from .motion import connect_robot, go_home, move_tcp, approach_blended, lift_and_transfer_blended
-from .transfer_plan import prepare_transfer, transfer_waypoint
+from .motion import (connect_robot, go_home, move_tcp, approach_blended,
+                     lift_and_transfer_blended, log_controller_fault, recover_unclosed_pick)
+from .motion_command import PlanRejected
+from .pick_plan import prepare_pick
+from .transfer_plan import prepare_transfer, transfer_waypoint, _require_stopped
 from .payload import load_payload_check
 from .perception import detect_frame
 from .postprocess import mask_depth_to_roi, uses_standalone_foundgrasp
 from .recording import write_manifest, save_detection
 from .roi import draw_overlay, exclude_near, project_px
 from .se3 import inv_se3, pose_delta
-from .selection import select_grasp
+from .selection import candidate_j7_limits, select_grasp
 from .transforms import load_hand_eye, camera_lateral_dir_tcp
 from .timing import CycleTiming, TaktStats
 from .viz import draw_score_grippers, gripper_segments_px
@@ -74,6 +77,24 @@ def wait_user(stream, msg):
     return ans != "q"
 
 
+def wait_to_rescan(stream, stop, cfg, auto, message):
+    """No feasible plan is an idle scene, not a controller fault."""
+    if not auto:
+        return wait_user(stream, message)
+    delay = float(cfg.get("retry", {}).get("no_candidate_wait_s", 2.))
+    if not np.isfinite(delay) or delay <= 0:
+        raise ValueError("retry.no_candidate_wait_s는 유한한 양수여야 합니다")
+    console.row("대기", f"실행 후보 없음 · {delay:g}초 후 자동 재스캔 (Ctrl+C=종료)")
+    stream.set_status("NO FEASIBLE PLAN - waiting to rescan")
+    deadline = time.monotonic() + delay
+    while time.monotonic() < deadline:
+        stream.raise_if_failed()
+        if stop.requested or stream.quit_requested:
+            return False
+        time.sleep(min(.1, max(0., deadline - time.monotonic())))
+    return not (stop.requested or stream.quit_requested)
+
+
 def _payload_verdict(robot, payload):
     """릴리즈 직전 페이로드 확인. 반환 (물체 있음 여부, 출력용 문구).
 
@@ -107,13 +128,16 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
                 "Pre-grasp / adjusting width / approach": "접근(폭 조절 병행)",
                 "Closing gripper": "파지 닫힘",
                 "Retreat / rise / stop / transfer": "복귀·상승",
+                "Retreat / rise / transfer": "복귀·상승·이송",
                 "Joint transfer": "조인트 이송",
+                "Preparing joint transfer": "이송 계획",
                 "At release pose": "릴리즈 준비",
                 "Releasing": "개방",
                 "Pre-grasp / opening": "pre-grasp(폭 조절 병행)",
                 "Waiting for approach confirmation": "사용자 확인",
                 "Approaching": "접근",
                 "Preparing transfer": "상승 계획",
+                "Returning for replanning": "재계획 복귀",
                 "Reopening / retracting": "실패 후 복귀",
             }
             timing.mark(labels.get(name, name))
@@ -125,22 +149,25 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
     if stream is not None:
         stream.raise_if_failed()
 
-    # Also guard direct calls / disabled per-candidate IK before moving or closing.
+    prepared_pick = getattr(sel, "pick_plan", None)
     transfer_sign = getattr(sel, "transfer_sign", 1)
-    T_transfer, _ = transfer_waypoint(
-        sel.T_tcp_pre, sel.T_tcp_lift, d, robot.R_home_tcp, closing_sign=transfer_sign)
-    if not robot.check_flange_ik(T_transfer @ inv_se3(robot.T_flange_tcp)):
-        print(f"  상승 경유점 사전 IK 실패: TCP {np.round(T_transfer[:3, 3] * 1000, 1).tolist()} mm")
-        return "abort", "상승 경유점 사전 IK"
-    if cfg.get("selection", {}).get("ik_check_per_candidate", False):
-        lo, hi = cfg["selection"].get("j7_limit_deg", [-89., 90.])
-        # Floor clamping may have shifted the selected endpoints. Validate the
-        # chosen symmetry again before approaching or closing the gripper.
-        for T in (sel.T_tcp_pre, sel.T_tcp_grasp, T_transfer):
-            joints = robot.flange_ik_joints_deg(T @ inv_se3(robot.T_flange_tcp))
-            if (joints is None or len(joints) != 7 or not np.isfinite(joints).all()
-                    or not lo <= joints[6] <= hi):
-                return "abort", "선정 경로 사전 IK/J7 재검사"
+    if prepared_pick is not None:
+        prepared_pick.check_start(robot)
+    else:
+        # Manual/direct calls retain the endpoint guard. Automatic demo picks
+        # arrive with a complete native-checked plan, including alternative lifts.
+        T_transfer, _ = transfer_waypoint(
+            sel.T_tcp_pre, sel.T_tcp_lift, d, robot.R_home_tcp, closing_sign=transfer_sign)
+        if not robot.check_flange_ik(T_transfer @ inv_se3(robot.T_flange_tcp)):
+            print(f"  상승 경유점 사전 IK 실패: TCP {np.round(T_transfer[:3, 3] * 1000, 1).tolist()} mm")
+            return "abort", "상승 경유점 사전 IK"
+        if cfg.get("selection", {}).get("ik_check_per_candidate", False):
+            lo, hi = candidate_j7_limits(cfg["selection"])
+            for T in (sel.T_tcp_pre, sel.T_tcp_grasp, T_transfer):
+                joints = robot.flange_ik_joints_deg(T @ inv_se3(robot.T_flange_tcp))
+                if (joints is None or len(joints) != 7 or not np.isfinite(joints).all()
+                        or not lo <= joints[6] <= hi):
+                    return "abort", "선정 경로 사전 IK/J7 재검사"
     # 기본 모드에서는 pre-grasp 이동 중 폭 조절, 완료 확인 후 최종 접근한다.
     # 최초 활성화 후에는 준비 상태만 확인하며 재활성화 대기를 반복하지 않는다.
     robot.enable_motion()
@@ -153,12 +180,40 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
             if stop is not None and stop.requested:
                 raise RuntimeError("사용자 정지 요청")
 
+        def check_preopen():
+            # Width adjustment blocks the host while pre-grasp is moving.
+            # Monitor that interval too, without requiring an empty motion queue.
+            check_approach()
+            if prepared_pick is None:
+                return
+            state_code, state = robot.arm.get_state()
+            error_code, errors = robot.arm.get_err_warn_code()
+            if (state_code or error_code or state not in (0, 1, 2)
+                    or not isinstance(errors, (tuple, list)) or not errors or errors[0]
+                    or robot.arm.mode != 0):
+                log_controller_fault(robot, errors)
+                raise RuntimeError(f"접근 중 폭 조절: 로봇 오류/정지 "
+                                   f"(state={state}, error={errors}, mode={robot.arm.mode})")
+            joint_code, raw_joints = robot.arm.get_servo_angle(is_radian=False)
+            try:
+                joints = np.asarray(raw_joints, dtype=float)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("접근 중 폭 조절: 실제 관절 판독 오류") from exc
+            if joint_code or joints.shape != (7,) or not np.isfinite(joints).all():
+                raise RuntimeError("접근 중 폭 조절: 실제 관절 판독 오류")
+            lo, hi = cfg["selection"].get("j7_limit_deg", [-89., 90.])
+            if not lo <= joints[6] <= hi:
+                raise RuntimeError(f"접근 중 폭 조절: 실측 J7 {joints[6]:.2f}° 제한 초과")
+
         phase("Pre-grasp / adjusting width / approach")
         approach_metrics = {}
+        planned = {} if prepared_pick is None else dict(
+            commands=prepared_pick.approach_commands,
+            j7_limits=cfg["selection"].get("j7_limit_deg", [-89., 90.]))
         if not approach_blended(robot, sel.T_tcp_pre, sel.T_tcp_grasp,
                                 r, check=check_approach,
-                                prepare=lambda: gripper.pre_open(sel.open_width_m, check=check_approach),
-                                metrics=approach_metrics):
+                                prepare=lambda: gripper.pre_open(sel.open_width_m, check=check_preopen),
+                                metrics=approach_metrics, **planned):
             return "abort", "연속 접근 이동"
         if timing is not None and approach_metrics:
             timing.notes.append(
@@ -224,24 +279,79 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
     constraint = None if direction is None else (
         direction, -np.sin(np.radians(float(camera_up.get("max_down_deg", 20.)))))
     try:
+        preferred = ({} if prepared_pick is None else
+                     {"preferred_route": prepared_pick.transfer_route})
         plan = prepare_transfer(
             robot, sel.T_tcp_pre, sel.T_tcp_lift, r, d, transfer_sign=transfer_sign,
             j7_limits=cfg.get("selection", {}).get("j7_limit_deg", [-89., 90.]),
-            camera_up=constraint, allow_symmetry=True, check=check_transfer)
+            camera_up=constraint, allow_symmetry=True, check=check_transfer, **preferred)
     except CameraError:
         raise
+    except PlanRejected as exc:
+        print(f"[계획 기각] {exc}")
+        if prepared_pick is None:
+            return "abort", "상승 경로 준비"
+        phase("Returning for replanning")
+        console.row("재계획", "이송 대안 소진 · 그리퍼 개방 상태로 접근 경로 복귀 검사")
+        check_transfer()
+        if recover_unclosed_pick(
+                robot, prepared_pick, r, check=check_transfer,
+                j7_limits=cfg["selection"].get("j7_limit_deg", [-89., 90.])):
+            return "replan", "경로 기각 · 스캔 위치 복귀 완료"
+        return "abort", "재계획 복귀 실패"
     except RuntimeError as exc:
         print(f"[robot] {exc}")
+        predicted = getattr(sel, "j7_range_deg", None)
+        if predicted is not None:
+            console.row("선정 시 IK", f"예상 J7 {predicted[0]:.1f}~{predicted[1]:.1f}° · "
+                        "실측 파지 자세에서의 재검사와 다를 수 있음")
         return "abort", "상승 경로 준비"
     if plan.transfer_sign != transfer_sign:
         console.row("상승 계획", f"실측 자세에서 대칭 방향 변경 {transfer_sign:+d} → {plan.transfer_sign:+d}")
+    if plan.speed_scale < 1:
+        console.row("상승 계획", f"속도 초과 사전 검사 대응 · 기본 계획 대비 속도 {plan.speed_scale:.0%}, "
+                    f"가속도 {plan.speed_scale ** 2:.0%}로 초기 경로 검사 통과")
+    if getattr(plan, "route_name", "configured") != "configured":
+        console.row("상승 경로", f"{plan.route_name} · 이송 시작 Z {plan.upper[2, 3] * 1000:.0f} mm")
     if timing is not None:
         angle = pose_delta(plan.pre, plan.upper)[1]
-        timing.notes.append(f"상승 방향 {'홈' if plan.transfer_sign == 1 else '홈의 180° 대칭'} · "
-                            f"TCP 자세 전환 {angle:.1f}°")
+        direction = {'grasp': '파지 방향 유지', 'upright': '가까운 수직',
+                     'home': '홈'}[d.get('lift_orientation', 'upright')]
+        if getattr(plan, "route_name", "configured") != "configured":
+            direction = plan.route_name
+        if plan.transfer_sign == -1:
+            direction += '의 180° 대칭'
+        timing.notes.append(f"상승 방향 {direction} · TCP 자세 전환 {angle:.1f}° · "
+                            f"이송 시작 Z {plan.upper[2, 3] * 1000:.0f} mm")
+
+    def check_close():
+        check_transfer()
+        state_code, state = robot.arm.get_state()
+        error_code, errors = robot.arm.get_err_warn_code()
+        queue_code, pending = robot.arm.get_cmdnum()
+        if (state_code or error_code or queue_code or errors[0]
+                or state != 2 or pending != 0 or robot.arm.mode != 0):
+            log_controller_fault(robot, errors)
+            raise RuntimeError(
+                f"파지 닫힘 중 로봇 오류/정지 상태 변경 — 상승하지 않습니다 "
+                f"(state={state}, error/warn={errors}, pending={pending}, "
+                f"read_codes={[state_code, error_code, queue_code]})")
 
     phase("Closing gripper")
-    ok, pos = gripper.grip()
+    try:
+        check_close()
+        ok, pos = gripper.grip(check=check_close)
+        check_close()
+    except BaseException as exc:
+        robot.stop_motion()
+        try:
+            gripper.stop()
+        except Exception as stop_error:
+            print(f"경고: 닫힘 중단 후 그리퍼 정지 실패 ({stop_error})")
+        if isinstance(exc, CameraError) or not isinstance(exc, RuntimeError):
+            raise
+        print(f"[gripper] {exc}")
+        return "abort", "파지 닫힘"
     console.detail(f"닫힘: finger {pos}% · 판정 {'적용' if grip_check else '미적용'}")
     if not ok and grip_check:
         phase("Reopening / retracting")
@@ -250,18 +360,23 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
             return "abort", "파지 실패 후 복귀 이동"
         return "fail", "파지"
 
-    phase("Retreat / rise / stop / transfer")
+    phase("Retreat / rise / transfer" if plan.continuous else "Retreat / rise / stop / transfer")
 
     transfer_metrics = {}
     if not lift_and_transfer_blended(robot, plan, r, d,
                                      check=check_transfer, on_stage=phase,
                                      metrics=transfer_metrics):
-        return "abort", "상승/이송 이동"
+        return "abort", transfer_metrics.get('failure_stage', '상승/이송 이동')
     if timing is not None and transfer_metrics:
-        timing.notes.append(
-            f"복귀·상승 명령~완료 {transfer_metrics['retreat_rise_s']:.2f}s "
-            f"(정지 확인 {transfer_metrics['upper_confirm_s']:.2f}s 포함) · "
-            f"릴리즈 도착 확인 {transfer_metrics['arrival_confirm_s']:.2f}s (이송에 포함)")
+        if 'continuous_transfer_s' in transfer_metrics:
+            timing.notes.append(
+                f"복귀·상승·이송 연속 {transfer_metrics['continuous_transfer_s']:.2f}s · "
+                f"릴리즈 도착 확인 {transfer_metrics['arrival_confirm_s']:.2f}s 포함")
+        else:
+            timing.notes.append(
+                f"복귀·상승 명령~완료 {transfer_metrics['retreat_rise_s']:.2f}s "
+                f"(정지 확인 {transfer_metrics['upper_confirm_s']:.2f}s 포함) · "
+                f"릴리즈 도착 확인 {transfer_metrics['arrival_confirm_s']:.2f}s (이송에 포함)")
 
     # 놓기 직전 페이로드 확인 (옵션) — 고정 자세의 관절 중력 토크를 빈 손 기준과
     # 비교. grip_check=False에서도 측정·출력은 유지 (임계값 실측 자료).
@@ -344,7 +459,7 @@ def _run(cfg, auto=True, dry_run=False):
     console.row("설정", cfg["_config_path"])
     console.row("모드", "DRY-RUN · 로봇 이동 없음" if dry_run else (
         "자동 실행" if auto else "접근 전 사용자 확인"))
-    console.row("측정", "홈 이동 시작 → 릴리즈 조건 충족 · 초기화/워밍업 제외")
+    console.row("측정", "홈 이동 시작 → 릴리즈 조건 충족 · 초기화/워밍업 제외 · 첫 회는 홈에서 시작")
     console.row("영상 좌표", "K/D 왜곡 보정 · RGB/depth/ROI 동일 좌표" if get(cfg, 'calib.undistort', False)
                 else "왜곡 보정 미적용")
     if not grip_check:
@@ -380,7 +495,7 @@ def _run(cfg, auto=True, dry_run=False):
         completed = outcome == "success" and not dry_run
         if completed:
             takt.add(seconds)
-        label = {"success": "이송 완료", "fail": "파지 판정에 따른 재시도",
+        label = {"success": "이송 완료", "fail": "파지 판정에 따른 재시도", "replan": "경로 재선정",
                  "abort": "중단", "no_candidate": "후보 없음", "preview": "미리보기 완료"}[outcome]
         console.row("결과", label + (f" · {reason}" if reason else ""))
         summary = cycle_timing.report(completed=completed, stats=takt)
@@ -415,8 +530,18 @@ def _run(cfg, auto=True, dry_run=False):
         if not dry_run:
             from .gripper import GripperCtl
             robot = connect_robot(cfg)
-            gripper = GripperCtl(cfg).connect()
+            console.row("초기화", "홈 복귀 → 그리퍼 초기화·방향 점검")
+            stream.raise_if_failed()
+            if stream.quit_requested or stop.requested:
+                return stats
+            go_home(robot, cfg)  # Blocking: fingers stay untouched until home completes.
+            stream.raise_if_failed()
+            if stream.quit_requested or stop.requested:
+                return stats
+            gripper = GripperCtl(cfg)
+            gripper.connect()
             viz.start_robot_stream(robot, gripper=gripper)
+            viz.start_live_cloud_stream(stream, robot, T_flange_cam)
 
         inference_retry = 0
         max_inference_retries = int(cfg["retry"].get("max_inference_retries", 3))
@@ -424,6 +549,8 @@ def _run(cfg, auto=True, dry_run=False):
             raise ValueError("retry.max_inference_retries는 0 이상이어야 합니다")
         failed_pts = []  # 직전 실패 그립 지점 (base) — 성공/대기 시 초기화
         fail_streak = 0
+        scan_pose_ready = True  # Initial home, or a checked reverse approach, already completed.
+        fresh_scan = False
         unsafe_stop = False  # 이동 실패 abort — 자동 홈 복귀 금지(2차 충돌 위험)
         while not (stream.quit_requested or stop.requested):
             stream.raise_if_failed()
@@ -437,7 +564,11 @@ def _run(cfg, auto=True, dry_run=False):
                 viz.log_stage("Homing" if not dry_run else "Home pose preview")
                 stream.set_status(f"CYCLE {n}: HOMING")
                 if robot is not None:
-                    go_home(robot, cfg)
+                    # Planning-only retries and checked reverse approaches leave
+                    # the arm at the scan pose; do not send a redundant home move.
+                    if not scan_pose_ready:
+                        go_home(robot, cfg)
+                    scan_pose_ready = True
                     T_base_flange, _ = robot.get_flange_pose()
                     robot.R_home_tcp = (T_base_flange @ robot.T_flange_tcp)[:3, :3].copy()
                 else:
@@ -451,8 +582,9 @@ def _run(cfg, auto=True, dry_run=False):
             stream.set_marks([])
             if inference_retry == 0:
                 time.sleep(0.3)  # 정지 후 temporal filter 안정화
-            rgb, depth_m, K = (stream.snapshot(fresh=True) if inference_retry
+            rgb, depth_m, K = (stream.snapshot(fresh=True) if inference_retry or fresh_scan
                                else stream.snapshot())
+            fresh_scan = False
 
             # 입력: ROI 밖 depth 무효화(0) — 전 방법 동일. 전체 프레임 추론 시 후보가
             # ROI 밖(릴리즈 박스 더미)에 몰려 ROI 내 후보가 0개가 되는 것을 방지.
@@ -484,6 +616,8 @@ def _run(cfg, auto=True, dry_run=False):
             viz.log_scan(rgb, depth_m, K, T_base_cam, roi)
             viz.log_candidates(gg_roi, K, counts, detect_ms)
             viz.log_text(f"사이클 {n}: 검출 {detect_ms:.0f}ms + 후처리 {post_ms:.0f}ms, 후보 {counts}")
+            if stop.requested or stream.quit_requested:
+                break
 
             if len(gg_roi) == 0:
                 if inference_retry < max_inference_retries:
@@ -493,8 +627,11 @@ def _run(cfg, auto=True, dry_run=False):
                 finish_cycle("no_candidate", f"추론 {max_inference_retries + 1}회 소진")
                 inference_retry = 0
                 stream.set_status("NO CANDIDATE - waiting user")
-                if not wait_user(stream, "재추론 한도 도달 — 장면 확인 후 재개하세요."):
+                if not wait_to_rescan(stream, stop, cfg, auto and not dry_run,
+                                      "재추론 한도 도달 — 장면 확인 후 재개하세요."):
                     break
+                failed_pts = []  # A later scene must not inherit an exhausted blacklist.
+                fresh_scan = True
                 continue
 
             # 사이클 기록: Rerun과 같은 점수 색상/표시 후보, 선정은 청록색.
@@ -508,15 +645,40 @@ def _run(cfg, auto=True, dry_run=False):
 
             pool = exclude_near(gg_roi, T_base_cam,
                                 failed_pts, cfg["retry"]["exclude_radius_m"])
+            candidate_prepare = None
+            if robot is not None and auto:
+                def planning_guard():
+                    stream.raise_if_failed()
+                    if stop.requested or stream.quit_requested:
+                        raise RuntimeError("사용자 정지 요청 — 경로 계획 중단")
+
+                def candidate_prepare(cand):
+                    planning_guard()
+                    if floor_map is not None:
+                        cand, _ = clamp_to_floor(cand, pool[cand.index], floor_map, cfg)
+                        if cand is None:
+                            raise PlanRejected("바닥 여유를 확보할 수 없는 파지")
+                    cand.pick_plan = prepare_pick(
+                        robot, cand, cfg, check=planning_guard,
+                        j7_limits=candidate_j7_limits(cfg["selection"]))
+                    cand.j7_range_deg = cand.pick_plan.j7_range_deg
+                    return cand
             # 선정 + (옵션) 하강 제한: 삽입 축소로 해결되면 채택, 하한까지
             # 줄여도 박스 여유가 부족하면 후보를 제외하고 재선정
             s = g_sel = None
             for _ in range(10):
-                report = select_grasp(pool, T_base_cam, cfg, robot=robot)
+                preparation = {} if candidate_prepare is None else {"candidate_prepare": candidate_prepare}
+                if candidate_prepare is not None:
+                    planning_guard()
+                    _require_stopped(robot)
+                report = select_grasp(pool, T_base_cam, cfg, robot=robot, **preparation)
+                if candidate_prepare is not None:
+                    planning_guard()
+                    _require_stopped(robot)
                 if report.selected is None:
                     break
                 cand = report.selected
-                if floor_map is None:
+                if floor_map is None or candidate_prepare is not None:
                     s, g_sel = cand, pool[cand.index]
                     break
                 adj, d_back = clamp_to_floor(cand, pool[cand.index],
@@ -543,8 +705,11 @@ def _run(cfg, auto=True, dry_run=False):
                     continue
                 inference_retry = 0
                 finish_cycle("no_candidate", "재추론 한도 도달 · 실행 가능한 자세 없음")
-                if not wait_user(stream, "재추론 한도 도달 — 실행 가능한 자세가 없습니다."):
+                if not wait_to_rescan(stream, stop, cfg, auto and not dry_run,
+                                      "재추론 한도 도달 — 실행 가능한 자세가 없습니다."):
                     break
+                failed_pts = []
+                fresh_scan = True
                 continue
 
             inference_retry = 0
@@ -570,8 +735,23 @@ def _run(cfg, auto=True, dry_run=False):
             console.row("선정", f"#{s.index + 1}/{len(pool)} · score {s.score:.6g} · "
                         f"폭 {s.width_m * 1000:.0f} → 개방 {s.open_width_m * 1000:.0f} mm · "
                         f"기울기 {s.tilt_deg:.0f}°")
-            console.row("목표", "  ".join(f"{axis} {value * 1000:.1f}" for axis, value in
+            if getattr(s, "pick_plan", None) is not None:
+                route = s.pick_plan.transfer_route
+                console.row("전체 경로", f"{route.name} · 이송 시작 Z {route.upper[2, 3] * 1000:.0f} mm · "
+                            "접근→복귀→이송 검사 통과")
+            predicted = getattr(s, "j7_range_deg", None)
+            if predicted is not None:
+                lo, hi = cfg["selection"].get("j7_limit_deg", [-89., 90.])
+                reserve = min(predicted[0] - lo, hi - predicted[1])
+                console.row("손목 계획", f"예상 J7 {predicted[0]:.1f}~{predicted[1]:.1f}° · "
+                            f"한계까지 최소 {reserve:.1f}° 여유")
+            console.row("검출점", "  ".join(f"{axis} {value * 1000:.1f}" for axis, value in
                                        zip("XYZ", s.p_base)) + " mm")
+            tcp_target = s.T_tcp_grasp[:3, 3]
+            insertion_mm = np.linalg.norm(tcp_target - s.p_base) * 1000
+            console.row("TCP 목표", "  ".join(f"{axis} {value * 1000:.1f}" for axis, value in
+                                             zip("XYZ", tcp_target))
+                        + f" mm · 검출점에서 삽입 {insertion_mm:.1f} mm")
             viz.log_selected(g_one, s, K)
             viz.log_text(msg)
 
@@ -584,6 +764,7 @@ def _run(cfg, auto=True, dry_run=False):
 
             cycle_timing.mark("모션 준비")
             console.row("실행", "접근·폭 조절 → 닫힘 → 복귀·상승 → 이송 → 개방")
+            scan_pose_ready = False
             outcome, reason = pick_and_place(robot, gripper, s, cfg, auto,
                                              payload=payload,
                                              grip_check=grip_check, stream=stream, viz=viz,
@@ -601,6 +782,13 @@ def _run(cfg, auto=True, dry_run=False):
             if outcome == "success":
                 stats["success"] += 1
                 failed_pts, fail_streak = [], 0
+            elif outcome == "replan":
+                # No close command was sent. Exclude this scene location until
+                # success or an exhausted retry round; do not count a failed grip.
+                scan_pose_ready = True
+                fresh_scan = True
+                failed_pts.append(s.p_base)
+                console.row("재선정", "복귀 완료 · 해당 지점 제외 후 새 프레임에서 계속")
             else:
                 stats["fail"] += 1
                 fail_streak += 1

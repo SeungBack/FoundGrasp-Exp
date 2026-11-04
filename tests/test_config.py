@@ -24,6 +24,11 @@ def test_requested_defaults_are_off():
     assert cfg["grip_check"]["enabled"] is False  # 파지 판정 미적용이 기본 (플렉스 팁)
 
 
+def test_reproduced_mixed_blend_fault_is_disabled_in_shared_defaults():
+    assert load_config()['drop']['transfer_blend_radius_mm'] == 0
+    assert load_config('configs/benchmark.yaml')['drop']['transfer_blend_radius_mm'] == 0
+
+
 def test_set_override_parses_yaml_values():
     cfg = load_config(overrides=["floor_limit.enabled=true",
                                  "selection.approach_max_tilt_deg=30",

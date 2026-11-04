@@ -23,21 +23,35 @@ def bevel_box(size, center, radius=0.003):
     return mesh
 
 
-def gripper_parts(tcp_z):
-    """(경로, 메쉬, RGB). left/right는 개폐 시 이동할 자식 그룹."""
+def gripper_parts(tcp_z, tip_length_m=.080):
+    """(경로, 메쉬, RGB). left/right는 개폐 시 이동할 자식 그룹.
+
+    tip_length_m is the whole replaceable finger, from its root to TCP z=0,
+    including the distal contact pad. It is not added to the metal finger.
+    The remaining flange-to-root length belongs to the housing/carriage model.
+    """
+    tcp_z, tip_length_m = float(tcp_z), float(tip_length_m)
+    if (not np.isfinite([tcp_z, tip_length_m]).all() or tip_length_m <= 0
+            or tcp_z <= tip_length_m + .027):
+        raise ValueError("그리퍼 그림 치수는 양수이고 TCP 길이에 팁·장착부가 들어가야 합니다")
     dark, metal, rubber = (45, 52, 62), (178, 188, 198), (38, 42, 48)
     mount = trimesh.creation.cylinder(radius=.033, height=.012, sections=48)
     mount.apply_translation([0, 0, -tcp_z + .006])
     parts = [('mount', mount, metal)]
-    length = max(.04, tcp_z - .095 - .012)
+    length = tcp_z - tip_length_m - .015 - .012
     parts += [('housing', bevel_box([.068, .106, length], [0, 0, -tcp_z + .012 + length/2], .007), dark),
-              ('face', bevel_box([.058, .094, .009], [0, 0, -.0995], .003), metal),
+              ('face', bevel_box([.058, .094, .009], [0, 0, -tip_length_m - .0195], .003), metal),
               ('inset', bevel_box([.002, .063, length*.52], [.034, 0, -tcp_z + .012 + length*.52], .0005), (72, 82, 94))]
+    pad = min(.028, tip_length_m * .35)
+    overlap = min(.007, pad * .25)
+    finger_end = -(pad - overlap)
+    finger_length = tip_length_m + finger_end
     for side, sign in [('left', 1), ('right', -1)]:
-        parts += [(f'{side}/carriage', bevel_box([.040, .024, .018], [0, sign*.012, -.087], .003), metal),
-                  (f'{side}/finger', bevel_box([.024, .014, .058], [0, sign*.011, -.050], .0025), metal),
-                  (f'{side}/tip', bevel_box([.027, .010, .028], [0, sign*.005, -.014], .003), rubber)]
+        parts += [(f'{side}/carriage', bevel_box([.040, .024, .018], [0, sign*.012, -tip_length_m - .007], .003), metal),
+                  (f'{side}/finger', bevel_box([.024, .014, finger_length],
+                                             [0, sign*.011, (-tip_length_m + finger_end)/2], .0025), metal),
+                  (f'{side}/tip', bevel_box([.027, .010, pad], [0, sign*.005, -pad/2], .003), rubber)]
         for i in range(4):
-            parts.append((f'{side}/tip_rib{i}', bevel_box([.023, .0015, .0018],
-                          [0, sign*.00075, -.006-i*.005], .0005), (65, 70, 78)))
+            parts.append((f'{side}/tip_rib{i}', bevel_box([.023, .0015, min(.0018, pad*.07)],
+                          [0, sign*.00075, -pad*(.2+i*.18)], .0005), (65, 70, 78)))
     return parts

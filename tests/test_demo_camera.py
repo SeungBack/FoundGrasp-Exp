@@ -33,6 +33,11 @@ def setup_pick(monkeypatch):
     robot.R_home_tcp = np.eye(3)
     robot.check_flange_ik.return_value = True
     robot.arm.get_state.return_value = 0, 2
+    robot.arm.mode = 0
+    robot.arm.version_number = [2, 7, 1]
+    robot.arm.only_check_result = 0
+    robot.arm.set_position.return_value = 0
+    robot.arm.set_servo_angle.return_value = 0
     robot.arm.get_cmdnum.return_value = 0, 0
     robot.arm.get_err_warn_code.return_value = 0, [0, 0]
     gripper = Mock()
@@ -51,7 +56,7 @@ def setup_pick(monkeypatch):
     cfg = {
         "robot": {"travel_speed_mm_s": 100, "approach_speed_mm_s": 20,
                   "lift_speed_mm_s": 100, "approach_acc_mm_s2": 100},
-        "drop": {"joints_deg": [0.0] * 7},
+        "drop": {"joints_deg": [0.0] * 7, "joint_speed_deg_s": 120},
     }
     move = Mock(return_value=True)
     monkeypatch.setattr(demo, "move_tcp", move)
@@ -67,6 +72,113 @@ def assert_only_pregrasp(p):
     np.testing.assert_array_equal(p.move.call_args.args[1], p.selected.T_tcp_pre)
     p.robot.arm.set_tcp_maxacc.assert_not_called()
     p.gripper.grip.assert_not_called()
+
+
+@pytest.mark.parametrize('recovery_ok', [True, False])
+def test_clean_late_plan_rejection_returns_before_close_and_reselects(
+        setup_pick, monkeypatch, recovery_ok):
+    from efg.motion_command import PlanRejected
+    p = setup_pick
+    p.cfg['selection'] = {'j7_limit_deg': [-89, 90]}
+    planned = SimpleNamespace(check_start=Mock(), approach_commands=('pre', 'grasp'),
+                              transfer_route=object())
+    p.selected.pick_plan = planned
+    approach = Mock(return_value=True)
+    transfer = Mock(side_effect=PlanRejected('native check C21; all routes unavailable'))
+    recovery = Mock(return_value=recovery_ok)
+    monkeypatch.setattr(demo, 'approach_blended', approach)
+    monkeypatch.setattr(demo, 'prepare_transfer', transfer)
+    monkeypatch.setattr(demo, 'recover_unclosed_pick', recovery)
+    outcome, _ = demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                                     auto=True, stream=p.stream)
+    assert outcome == ('replan' if recovery_ok else 'abort')
+    assert approach.call_args.kwargs['commands'] is planned.approach_commands
+    assert transfer.call_args.kwargs['preferred_route'] is planned.transfer_route
+    recovery.assert_called_once()
+    p.gripper.grip.assert_not_called()
+    p.gripper.release.assert_not_called()
+
+
+def test_actual_fault_after_approach_does_not_attempt_automatic_recovery(setup_pick, monkeypatch):
+    p = setup_pick
+    p.cfg['selection'] = {'j7_limit_deg': [-89, 90]}
+    p.selected.pick_plan = SimpleNamespace(check_start=Mock(), approach_commands=('pre', 'grasp'),
+                                          transfer_route=object())
+    monkeypatch.setattr(demo, 'approach_blended', Mock(return_value=True))
+    monkeypatch.setattr(demo, 'prepare_transfer', Mock(side_effect=RuntimeError('actual C31')))
+    recovery = Mock()
+    monkeypatch.setattr(demo, 'recover_unclosed_pick', recovery)
+    assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                               auto=True, stream=p.stream)[0] == 'abort'
+    recovery.assert_not_called()
+    p.gripper.grip.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', ['c31', 'state', 'mode', 'joint_limit',
+                                    'joint_read', 'joint_nan'])
+def test_preopen_monitors_moving_robot_and_never_queues_approach_on_fault(
+        setup_pick, monkeypatch, failure):
+    from efg.motion import approach_blended
+    from efg.motion_command import approach_commands
+
+    p = setup_pick
+    p.cfg['selection'] = {'j7_limit_deg': [-89., 90.]}
+    start = p.selected.T_tcp_pre.copy()
+    start[2, 3] += .2
+    p.selected.pick_plan = SimpleNamespace(
+        check_start=Mock(), transfer_route=object(),
+        approach_commands=approach_commands(start, p.selected.T_tcp_pre,
+                                            p.selected.T_tcp_grasp, p.cfg['robot']))
+    p.robot.arm.get_state.return_value = 0, 1  # pre-grasp is still moving
+    p.robot.arm.get_cmdnum.return_value = 0, 1
+    p.robot.arm.get_servo_angle.return_value = 0, [0.] * 7
+    p.robot.arm.get_c31_error_info.return_value = 0, [4, 17., -7.]
+    monkeypatch.setattr(demo, 'approach_blended', approach_blended)
+    prepare_transfer = Mock(side_effect=AssertionError('must stop before final approach'))
+    monkeypatch.setattr(demo, 'prepare_transfer', prepare_transfer)
+
+    def opening(width, *, check):
+        assert p.robot.arm.set_position.call_count == 1
+        check()  # moving state and queued pre-grasp are allowed
+        if failure == 'c31':
+            p.robot.arm.get_err_warn_code.return_value = 0, [31, 14]
+        elif failure == 'state':
+            p.robot.arm.get_state.return_value = 0, 5
+        elif failure == 'mode':
+            p.robot.arm.mode = 1
+        elif failure == 'joint_limit':
+            p.robot.arm.get_servo_angle.return_value = 0, [0.] * 6 + [91.]
+        elif failure == 'joint_read':
+            p.robot.arm.get_servo_angle.return_value = 9, [0.] * 7
+        else:
+            p.robot.arm.get_servo_angle.return_value = 0, [0.] * 6 + [float('nan')]
+        check()
+        raise AssertionError('fault must interrupt width adjustment')
+
+    p.gripper.pre_open.side_effect = opening
+    assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg, auto=True,
+                               stream=p.stream) == ('abort', '연속 접근 이동')
+    assert p.robot.arm.set_position.call_count == 1
+    p.robot.stop_motion.assert_called_once()
+    p.robot.arm.clean_error.assert_not_called()
+    prepare_transfer.assert_not_called()
+    p.gripper.grip.assert_not_called()
+
+
+def test_no_candidate_automatic_wait_is_interruptible_without_user_input(monkeypatch):
+    stream = FakeStream()
+    stop = SimpleNamespace(requested=False)
+    clock = [0.]
+    monkeypatch.setattr(demo.time, 'monotonic', lambda: clock[0])
+    def advance(seconds):
+        clock[0] += seconds
+        stop.requested = clock[0] >= .2
+    monkeypatch.setattr(demo.time, 'sleep', advance)
+    prompt = Mock(side_effect=AssertionError('automatic mode must not prompt'))
+    monkeypatch.setattr(demo, 'wait_user', prompt)
+    assert not demo.wait_to_rescan(stream, stop, {'retry': {'no_candidate_wait_s': 2}}, True, 'retry')
+    assert clock[0] < 1
+    prompt.assert_not_called()
 
 
 def test_failed_stream_prevents_any_pick_motion(setup_pick):
@@ -214,7 +326,7 @@ def test_auto_closes_only_after_approach_completes(setup_pick, monkeypatch):
         order.append("arrived")
         return True
 
-    def grip():
+    def grip(**kwargs):
         assert order == ["open", "arrived"]
         order.append("close")
         return False, 0.0
@@ -227,8 +339,93 @@ def test_auto_closes_only_after_approach_completes(setup_pick, monkeypatch):
     assert order[:3] == ["open", "arrived", "close"]
 
 
-@pytest.mark.parametrize("arrived,opened", [(True, True), (True, False), (False, True)])
-def test_release_requires_completed_transfer(setup_pick, monkeypatch, arrived, opened):
+@pytest.mark.parametrize("fault", ["collision", "state", "read", "queue", "mode"])
+@pytest.mark.parametrize("during_close", [True, False])
+def test_close_checks_robot_before_lifting_even_without_grasp_verdict(
+        setup_pick, monkeypatch, fault, during_close):
+    p = setup_pick
+    monkeypatch.setattr(demo, "approach_blended", Mock(return_value=True))
+    transfer = Mock()
+    monkeypatch.setattr(demo, "lift_and_transfer_blended", transfer)
+    p.robot.arm.get_c31_error_info.return_value = 0, [1, 2., 3.]
+
+    def close(*, check):
+        if fault == "collision":
+            p.robot.arm.get_err_warn_code.return_value = 0, [31, 14]
+        elif fault == "state":
+            p.robot.arm.get_state.return_value = 0, 5
+        elif fault == "read":
+            p.robot.arm.get_err_warn_code.return_value = 9, None
+        elif fault == "queue":
+            p.robot.arm.get_cmdnum.return_value = 0, 1
+        else:
+            p.robot.arm.mode = 1
+        if during_close:
+            check()
+        return False, 0.
+
+    p.gripper.grip.side_effect = close
+    assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                               auto=True, stream=p.stream, grip_check=False) == (
+                                   "abort", "파지 닫힘")
+    transfer.assert_not_called()
+    p.gripper.release.assert_not_called()
+    p.robot.stop_motion.assert_called_once()
+    p.gripper.stop.assert_called_once()
+    p.robot.arm.clean_error.assert_not_called()
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_close_execution_error_is_not_an_empty_grasp(setup_pick, monkeypatch, stop_fails):
+    p = setup_pick
+    monkeypatch.setattr(demo, "approach_blended", Mock(return_value=True))
+    transfer = Mock()
+    monkeypatch.setattr(demo, "lift_and_transfer_blended", transfer)
+    p.gripper.grip.side_effect = RuntimeError("close did not start")
+    if stop_fails:
+        p.gripper.stop.side_effect = OSError("Modbus unavailable")
+    assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                               auto=True, stream=p.stream, grip_check=False) == (
+                                   "abort", "파지 닫힘")
+    transfer.assert_not_called()
+    p.gripper.release.assert_not_called()
+    p.gripper.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("reason", ["camera", "stop"])
+def test_close_monitors_camera_and_stop_request(setup_pick, monkeypatch, reason):
+    p = setup_pick
+    monkeypatch.setattr(demo, "approach_blended", Mock(return_value=True))
+    transfer = Mock()
+    monkeypatch.setattr(demo, "lift_and_transfer_blended", transfer)
+    stop = SimpleNamespace(requested=False)
+
+    def close(*, check):
+        p.stream.failed = reason == "camera"
+        stop.requested = reason == "stop"
+        check()
+        pytest.fail("close guard did not interrupt")
+
+    p.gripper.grip.side_effect = close
+    if reason == "camera":
+        with pytest.raises(CameraError):
+            demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                                auto=True, stream=p.stream, stop=stop)
+    else:
+        assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                                   auto=True, stream=p.stream, stop=stop) == (
+                                       "abort", "파지 닫힘")
+    transfer.assert_not_called()
+    p.gripper.release.assert_not_called()
+    p.gripper.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("arrived,opened,failure_stage", [
+    (True, True, None), (True, False, None), (False, True, None),
+    (False, True, "조인트 이송 사전 검사"),
+])
+def test_release_requires_completed_transfer(setup_pick, monkeypatch, arrived, opened,
+                                             failure_stage):
     p = setup_pick
     p.selected.transfer_sign = -1
     p.gripper.grip.return_value = True, 40.
@@ -242,6 +439,8 @@ def test_release_requires_completed_transfer(setup_pick, monkeypatch, arrived, o
         assert args[1].transfer_sign == -1
         checked_pose = p.robot.check_flange_ik.call_args.args[0]
         np.testing.assert_array_equal(checked_pose[:3, :3], np.diag([-1., -1., 1.]))
+        if failure_stage:
+            kwargs["metrics"]["failure_stage"] = failure_stage
         return arrived
 
     monkeypatch.setattr(demo, "lift_and_transfer_blended", transfer)
@@ -252,7 +451,7 @@ def test_release_requires_completed_transfer(setup_pick, monkeypatch, arrived, o
         p.gripper.release.assert_called_once()
         assert p.gripper.release.call_args.args == (p.selected.open_width_m,)
     else:
-        assert result == ("abort", "상승/이송 이동")
+        assert result == ("abort", failure_stage or "상승/이송 이동")
         p.gripper.release.assert_not_called()
     p.move.assert_not_called()
 
@@ -302,7 +501,7 @@ def test_actual_state_alternate_is_prepared_before_closing_then_executed(setup_p
             return [0.] * 6 + [104.]
         return [0.] * 7
 
-    def close():
+    def close(**kwargs):
         queries_when_closed.append(p.robot.flange_ik_joints_deg.call_count)
         return True, 40.
 
@@ -323,7 +522,7 @@ def test_actual_state_alternate_is_prepared_before_closing_then_executed(setup_p
 
 
 @pytest.mark.parametrize("retry_mode", ["none", "empty", "selection", "exhausted",
-                                        "completed", "retry_completed", "motion_abort", "dryrun"])
+                                        "completed", "retry_completed", "two_completed", "motion_abort", "dryrun"])
 def test_run_cleans_up_camera_failure_without_exit_home(
         setup_pick, monkeypatch, tmp_path, capsys, retry_mode):
     from efg import gripper as gripper_module
@@ -358,8 +557,9 @@ def test_run_cleans_up_camera_failure_without_exit_home(
     viz = Mock()
     stop = Mock(requested=False)
     p.robot.get_flange_pose.return_value = np.eye(4), None
-    p.gripper.connect.return_value = p.gripper
-    home = Mock(side_effect=lambda *a: advance(2.))
+    startup_order = []
+    p.gripper.connect.side_effect = lambda: startup_order.append("gripper") or p.gripper
+    home = Mock(side_effect=lambda *a: startup_order.append("home") or advance(2.))
     p.stream.start.side_effect = lambda: advance(100.)  # excluded setup time
 
     monkeypatch.setattr(demo, "CameraStream", Mock(return_value=p.stream))
@@ -400,24 +600,34 @@ def test_run_cleans_up_camera_failure_without_exit_home(
         rejected = SimpleNamespace(selected=None, rejected=[(0, "IK")], summary=lambda: "IK")
         monkeypatch.setattr(demo, "select_grasp", Mock(side_effect=[
             rejected, rejected, SimpleNamespace(selected=p.selected, rejected=[])]))
-    if retry_mode in ("completed", "retry_completed", "motion_abort"):
+    if retry_mode in ("completed", "retry_completed", "two_completed", "motion_abort"):
+        completed = [0]
         def pick(*args, **kwargs):
             advance(3.)
-            p.stream.quit_requested = True
+            completed[0] += 1
+            p.stream.quit_requested = retry_mode != "two_completed" or completed[0] == 2
             return ("abort", "mock stop") if retry_mode == "motion_abort" else ("success", None)
         monkeypatch.setattr(demo, "pick_and_place", pick)
     if retry_mode == "dryrun":
         monkeypatch.setattr(demo, "_home_flange_pose", lambda cfg: (np.eye(4), np.zeros(7)))
     stats = demo.run(cfg, auto=False, dry_run=retry_mode == "dryrun")
-    if retry_mode in ("completed", "retry_completed", "motion_abort", "dryrun"):
+    if retry_mode == "dryrun":
+        assert startup_order == []
+        demo.connect_robot.assert_not_called()
+        gripper_module.GripperCtl.assert_not_called()
+    else:
+        assert startup_order[:2] == ["home", "gripper"]
+    if retry_mode in ("completed", "retry_completed", "two_completed", "motion_abort", "dryrun"):
         output = capsys.readouterr().out
-        if retry_mode in ("completed", "retry_completed"):
-            seconds = 8 if retry_mode == "retry_completed" else 6
+        if retry_mode in ("completed", "retry_completed", "two_completed"):
+            seconds = {"retry_completed": 6, "completed": 4, "two_completed": 5}[retry_mode]
+            count = 2 if retry_mode == "two_completed" else 1
             assert f"평균 {seconds:.2f}s" in output
-            assert "완료 1회" in output
-            assert stats["success"] == 1
+            assert f"완료 {count}회" in output
+            assert stats["success"] == count
+            assert home.call_count == count + 1  # startup, later cycles, controlled exit
             # One result per cycle; final statistics repeat only the aggregate.
-            assert sum(line.lstrip().startswith("결과 ") for line in output.splitlines()) == 1
+            assert sum(line.lstrip().startswith("결과 ") for line in output.splitlines()) == count
         else:
             assert "소요시간" in output
             assert "완료 사이클 없음" in output
@@ -432,7 +642,7 @@ def test_run_cleans_up_camera_failure_without_exit_home(
         assert p.stream.snapshot.call_count == 5  # warmup + 4 attempts
         waits.assert_called_once()
         p.gripper.grip.assert_not_called()
-        assert home.call_count == 2  # initial scan and normal exit
+        assert home.call_count == 2  # startup and normal exit
         assert stats["cycles"] == 1
         return
     waits.assert_not_called()
@@ -445,11 +655,70 @@ def test_run_cleans_up_camera_failure_without_exit_home(
     output = capsys.readouterr().out
     assert "test camera disconnected" in output
     assert "소요시간" in output and "완료 사이클 없음" in output
-    home.assert_called_once_with(p.robot, cfg)  # initial scan home only
+    home.assert_called_once_with(p.robot, cfg)  # startup home only; first scan reuses it
     assert_only_pregrasp(p)
     stop.restore.assert_called_once_with()
     viz.close.assert_called_once_with()
     detector.close.assert_called_once_with()
     p.stream.stop.assert_called_once_with()
     p.gripper.disconnect.assert_called_once_with()
+    p.robot.disconnect.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure", ["home", "camera", "stop", "gripper"])
+def test_startup_failure_never_calibrates_before_home_or_homes_on_exit(
+        setup_pick, monkeypatch, tmp_path, failure):
+    from efg import gripper as gripper_module
+
+    p = setup_pick
+    cfg = p.cfg | {
+        "_config_path": "mock.yaml", "scan_roi_px": [0, 0, 2, 2],
+        "detector": {"name": "foundgrasp", "warmup_runs": 0},
+        "calib": {"hand_eye": "mock.yaml"},
+        "output": {"dir": str(tmp_path)},
+    }
+    detector = Mock()
+    viz = Mock()
+    stop = Mock(requested=False)
+    constructor = Mock(return_value=p.gripper)
+    p.gripper.connect.side_effect = RuntimeError("gripper startup failed")
+
+    def home(*args):
+        constructor.assert_not_called()
+        if failure == "home":
+            raise RuntimeError("home failed")
+        if failure == "camera":
+            p.stream.failed = True
+        if failure == "stop":
+            stop.requested = True
+
+    home = Mock(side_effect=home)
+    monkeypatch.setattr(demo, "CameraStream", Mock(return_value=p.stream))
+    monkeypatch.setattr(demo, "build_detector", Mock(return_value=detector))
+    monkeypatch.setattr(demo, "connect_robot", Mock(return_value=p.robot))
+    monkeypatch.setattr(gripper_module, "GripperCtl", constructor)
+    monkeypatch.setattr(demo, "RerunViz", Mock(return_value=viz))
+    monkeypatch.setattr(demo, "StopRequest", Mock(return_value=stop))
+    monkeypatch.setattr(demo, "load_hand_eye", Mock(return_value=np.eye(4)))
+    monkeypatch.setattr(demo, "load_payload_check", Mock(return_value=None))
+    monkeypatch.setattr(demo, "go_home", home)
+
+    if failure in ("home", "gripper"):
+        with pytest.raises(RuntimeError, match="failed"):
+            demo.run(cfg)
+    else:
+        assert demo.run(cfg)["cycles"] == 0
+    home.assert_called_once_with(p.robot, cfg)
+    if failure == "gripper":
+        constructor.assert_called_once_with(cfg)
+        p.gripper.disconnect.assert_called_once_with()
+    else:
+        constructor.assert_not_called()
+        p.gripper.connect.assert_not_called()
+        p.gripper.disconnect.assert_not_called()
+    viz.start_robot_stream.assert_not_called()
+    stop.restore.assert_called_once_with()
+    viz.close.assert_called_once_with()
+    detector.close.assert_called_once_with()
+    p.stream.stop.assert_called_once_with()
     p.robot.disconnect.assert_called_once_with()

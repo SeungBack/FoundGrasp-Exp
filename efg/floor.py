@@ -67,6 +67,8 @@ def clamp_to_floor(sel, g, fmap, cfg):
         if total_back + d_back > budget:
             return None, total_back + d_back
         total_back += d_back
+        sel.j7_range_deg = None  # IK 표본은 조정 전 경로의 값이므로 재사용하지 않는다.
+        sel.pick_plan = None     # 변경된 목표는 전체 경로 검사를 다시 받아야 한다.
         shift = -d_back * a
         for name in ("T_tcp_grasp", "T_tcp_pre", "T_tcp_lift"):
             M = getattr(sel, name).copy()

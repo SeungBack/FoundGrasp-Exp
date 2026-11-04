@@ -110,3 +110,72 @@ def test_tcp_offset_is_removed_for_handeye_and_applied_once_for_commands(ready_r
     kwargs = robot.arm.set_position.call_args.kwargs
     actual_command = xarm_pose_to_se3([kwargs[k] for k in ('x','y','z','roll','pitch','yaw')])
     np.testing.assert_allclose(actual_command, target_tcp, atol=1e-12)
+
+
+@pytest.fixture
+def ik_robot(ready_robot):
+    ready_robot.T_flange_tcp = np.eye(4)
+    ready_robot.T_flange_tcp[2, 3] = .223
+    return ready_robot
+
+
+def test_ik_failure_preserves_sdk_code_and_converted_tcp_target(ik_robot):
+    from efg.se3 import xarm_pose_to_se3, se3_to_xarm_pose
+    flange = xarm_pose_to_se3([400., -200., 350., .1, -.2, .3])
+    target = se3_to_xarm_pose(flange @ ik_robot.T_flange_tcp)
+    ik_robot.arm.get_inverse_kinematics.return_value = 10, []
+
+    assert ik_robot.flange_ik_joints_deg(flange) is None
+
+    assert "SDK code=10" in ik_robot.last_ik_failure
+    assert f"TCP(mm/rad)={np.round(target, 6).tolist()}" in ik_robot.last_ik_failure
+    args, kwargs = ik_robot.arm.get_inverse_kinematics.call_args
+    np.testing.assert_allclose(args[0], target)
+    assert kwargs == dict(input_is_radian=True, return_is_radian=True)
+    ik_robot.arm.clean_error.assert_not_called()
+    ik_robot.arm.clean_warn.assert_not_called()
+
+
+def test_successful_ik_returns_degrees_and_clears_previous_failure(ik_robot):
+    ik_robot.arm.get_inverse_kinematics.return_value = 10, []
+    ik_robot.flange_ik_joints_deg(np.eye(4))
+    assert ik_robot.last_ik_failure is not None
+    radians = np.array([0., .1, -.2, .3, -.4, .5, -.6])
+    ik_robot.arm.get_inverse_kinematics.return_value = 0, radians
+
+    np.testing.assert_allclose(ik_robot.flange_ik_joints_deg(np.eye(4)), np.degrees(radians))
+    assert ik_robot.last_ik_failure is None
+    with pytest.raises(AttributeError):
+        ik_robot.last_ik_failure = "stale"
+
+
+@pytest.mark.parametrize("angles", [None, [], [0.] * 6, [0.] * 8,
+                                    [0.] * 6 + [float('nan')],
+                                    [0.] * 6 + [float('inf')],
+                                    [0.] * 6 + ['invalid'], [[0.] * 7]])
+def test_invalid_ik_angles_are_rejected_with_diagnostic(ik_robot, angles):
+    ik_robot.arm.get_inverse_kinematics.return_value = 0, angles
+    assert ik_robot.flange_ik_joints_deg(np.eye(4)) is None
+    assert "SDK code=0" in ik_robot.last_ik_failure
+    assert "7개 관절각" in ik_robot.last_ik_failure
+
+
+def test_missing_ik_api_has_a_diagnostic_without_commands(ik_robot):
+    ik_robot.arm = Mock(spec=[])
+    assert ik_robot.flange_ik_joints_deg(np.eye(4)) is None
+    assert "API 미지원" in ik_robot.last_ik_failure
+    assert "TCP(mm/rad)" in ik_robot.last_ik_failure
+    assert ik_robot.arm.mock_calls == []
+
+
+@pytest.mark.parametrize("error", [RuntimeError("connection lost"),
+                                  AttributeError("SDK internal failure")])
+def test_unexpected_ik_exception_propagates_without_stale_diagnostic(ik_robot, error):
+    ik_robot.arm.get_inverse_kinematics.return_value = 10, []
+    ik_robot.flange_ik_joints_deg(np.eye(4))
+    ik_robot.arm.get_inverse_kinematics.side_effect = error
+    with pytest.raises(type(error)) as caught:
+        ik_robot.flange_ik_joints_deg(np.eye(4))
+    assert caught.value is error
+    assert ik_robot.last_ik_failure is None
+    ik_robot.arm.clean_error.assert_not_called()

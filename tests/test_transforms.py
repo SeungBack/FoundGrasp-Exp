@@ -1,6 +1,7 @@
 """transforms/selection 오프라인 검증 (로봇/카메라/추론 불필요)."""
 
 import numpy as np
+import pytest
 
 from efg import transforms as T  # noqa: E402
 
@@ -71,3 +72,29 @@ def test_approach_tilt():
     # 접근 벡터가 수평이면 90도
     R2 = np.column_stack([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
     assert abs(T.approach_tilt_deg(R2) - 90.0) < 1e-6
+
+
+@pytest.mark.parametrize("tilt", [0., 20.])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_measured_tool_and_insertion_preserve_existing_pick_flange_target(tilt, sign):
+    """The 20mm tool correction must not deepen the working pick endpoint."""
+    from scipy.spatial.transform import Rotation
+    from efg.config import load_config
+    from efg.se3 import inv_se3, xarm_pose_to_se3
+
+    cfg = load_config()
+    downward = np.column_stack([[0., 0., -1.], [0., 1., 0.], [1., 0., 0.]])
+    R = Rotation.from_euler('y', tilt, degrees=True).as_matrix() @ downward
+    p = np.array([.4195, -.1055, .1272])
+    old_tcp = xarm_pose_to_se3([0., 0., 223., 0., 0., 0.])
+    offset = np.asarray(cfg['robot']['tcp_offset_mm_deg'], dtype=float).copy()
+    offset[3:] = np.radians(offset[3:])
+    new_tcp = xarm_pose_to_se3(offset)
+    for depth in (.015, .04):
+        old = T.tool_pose_from_grasp(R, p, sign, depth + .07)
+        new = T.tool_pose_from_grasp(R, p, sign,
+                                    depth + cfg['selection']['approach_extra_m'])
+        for retreat in (0., cfg['selection']['pre_grasp_offset_m']):
+            np.testing.assert_allclose(
+                T.offset_along_tool_z(old, retreat) @ inv_se3(old_tcp),
+                T.offset_along_tool_z(new, retreat) @ inv_se3(new_tcp), atol=1e-12)

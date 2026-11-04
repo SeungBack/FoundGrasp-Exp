@@ -172,3 +172,114 @@ def test_fresh_snapshot_waits_for_new_capture(make_stream):
     rgb, _, _ = stream.snapshot()
     newer, _, _ = stream.snapshot(fresh=True)
     assert int(newer[0, 0, 0]) > int(rgb[0, 0, 0])
+
+
+@pytest.fixture
+def preview_stream():
+    """Real shared buffers with a stationary fake producer and no SDK/process."""
+    from unittest.mock import Mock
+
+    stream = ProcessCameraStream({"camera": {"width": 6, "height": 4}}, live=False)
+    stream._started = True
+    stream._process = Mock()
+    stream._process.is_alive.return_value = True
+    rgb, depth, K = stream._arrays
+    depth[:] = np.arange(24, dtype=np.float32).reshape(4, 6)
+    rgb[:] = depth[..., None]
+    K[:] = [[100, 0, 3], [0, 110, 2], [0, 0, 1]]
+    stream._updated.value = time.monotonic()
+    stream._sequence.value = 7
+    yield stream
+    stream._started = False
+    stream._closed = False
+    stream.stop()
+
+
+def test_preview_downsamples_pixels_and_intrinsics_without_changing_shared_frame(preview_stream):
+    stream = preview_stream
+    original = tuple(a.copy() for a in stream._arrays)
+    rgb, depth, K, stamp, sequence = stream.preview_snapshot(stride=2)
+    np.testing.assert_array_equal(rgb, original[0][::2, ::2])
+    np.testing.assert_array_equal(depth, original[1][::2, ::2])
+    np.testing.assert_allclose(K, [[50, 0, 1.5], [0, 55, 1], [0, 0, 1]])
+    assert stamp == stream._updated.value and sequence == 7
+    for result, shared in zip((rgb, depth, K), stream._arrays):
+        assert not np.shares_memory(result, shared)
+        result[:] = 0
+    for shared, expected in zip(stream._arrays, original):
+        np.testing.assert_array_equal(shared, expected)
+
+
+def test_preview_metadata_matches_real_capture_buffer(make_stream):
+    stream = make_stream()
+    stream.snapshot()
+    previous = 0
+    for _ in range(5):
+        deadline = time.monotonic() + 1
+        frame = None
+        while frame is None and time.monotonic() < deadline:
+            frame = stream.preview_snapshot(after_sequence=previous)
+            if frame is None:
+                time.sleep(.005)
+        assert frame is not None
+        rgb, depth, K, stamp, sequence = frame
+        assert sequence > previous
+        assert 0 <= time.monotonic() - stamp <= stream._max_age
+        np.testing.assert_array_equal(depth, sequence % 200)
+        np.testing.assert_array_equal(rgb[:, :, 0], depth)
+        np.testing.assert_array_equal(K, np.eye(3))
+        previous = sequence
+
+
+def test_preview_skips_duplicate_frames(preview_stream):
+    assert preview_stream.preview_snapshot(after_sequence=7) is None
+    assert preview_stream.preview_snapshot(after_sequence=8) is None
+    assert preview_stream.preview_snapshot(after_sequence=6) is not None
+
+
+def test_preview_does_not_wait_on_shared_buffer_lock(preview_stream, monkeypatch):
+    from unittest.mock import Mock
+
+    lock = Mock()
+    lock.acquire.return_value = False
+    monkeypatch.setattr(preview_stream, "_lock", lock)
+    assert preview_stream.preview_snapshot() is None
+    lock.acquire.assert_called_once_with(False)
+    lock.release.assert_not_called()
+
+
+@pytest.mark.parametrize("unavailable", ["not_started", "closed", "error", "dead", "stale", "empty"])
+def test_preview_skips_unavailable_frames(preview_stream, unavailable):
+    stream = preview_stream
+    if unavailable == "not_started":
+        stream._started = False
+    elif unavailable == "closed":
+        stream._closed = True
+    elif unavailable == "error":
+        stream._error = "capture failed"
+    elif unavailable == "dead":
+        stream._process.is_alive.return_value = False
+    elif unavailable == "stale":
+        stream._updated.value = time.monotonic() - stream._max_age - 1
+    elif unavailable == "empty":
+        stream._sequence.value = 0
+    assert stream.preview_snapshot() is None
+
+
+def test_preview_leaves_error_pipe_for_main_control_loop(preview_stream, monkeypatch):
+    from unittest.mock import Mock
+
+    stream = preview_stream
+    check = Mock(side_effect=AssertionError("preview must not consume control errors"))
+    monkeypatch.setattr(stream, "_check", check)
+    stream._error_sender.send("USB disconnected")
+    assert stream.preview_snapshot() is not None
+    check.assert_not_called()
+    assert stream._errors.poll()
+    assert stream._errors.recv() == "USB disconnected"
+
+
+@pytest.mark.parametrize("stride", [0, -1, 1.5, True, np.bool_(True), "2", None])
+def test_preview_requires_positive_integer_stride(preview_stream, stride):
+    with pytest.raises(ValueError, match="stride"):
+        preview_stream.preview_snapshot(stride=stride)

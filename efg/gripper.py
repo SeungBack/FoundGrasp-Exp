@@ -37,6 +37,11 @@ STALL_HOLD_S = 1.0        # 이 시간 이상 위치 불변이면 잼으로 판�
 MOVE_TOL_TICKS = 4        # 위치 변화 감지 임계 (0.1% 단위)
 INIT_TIMEOUT_S = 20.0     # 초기화 스윕 대기 한도 (실측 6.6초 + 여유)
 CMD_START_TIMEOUT_S = 1.2 # 이동 명령 후 이 시간 내 이동 시작해야 함
+# Force-hold -> opening may briefly keep squeezing the object. Bound both
+# displacement and duration; a single status sample cannot establish direction.
+RELEASE_REVERSE_DEADBAND_MM = 0.5
+RELEASE_REVERSE_LIMIT_MM = 2.0
+RELEASE_REVERSE_CONFIRM_S = 0.2
 
 
 class GripperCtl:
@@ -60,12 +65,15 @@ class GripperCtl:
         self.release_margin_mm = float(g.get("release_margin_mm", 5.0))
         self.release_confirm_s = float(g.get("release_confirm_s", 0.1))
         self.release_timeout_s = float(g.get("release_timeout_s", 5.0))
+        self.release_full_open_tolerance_mm = float(g.get("release_full_open_tolerance_mm", 1.5))
         if self.release_mode not in ("width", "full"):
             raise ValueError("gripper.release_mode는 width 또는 full이어야 합니다")
         if not math.isfinite(self.stroke_mm) or self.stroke_mm <= 0:
             raise ValueError("gripper.stroke_mm는 유한한 양수여야 합니다")
         if not 0 < self.release_margin_mm <= self.stroke_mm:
             raise ValueError("gripper.release_margin_mm는 0 초과, stroke_mm 이하여야 합니다")
+        if not 0 <= self.release_full_open_tolerance_mm <= min(2., self.stroke_mm * .02):
+            raise ValueError("gripper.release_full_open_tolerance_mm는 0~min(2mm, stroke의 2%) 범위여야 합니다")
         if not (0 <= self.release_confirm_s <= 2 and
                 self.release_confirm_s < self.release_timeout_s <= 10):
             raise ValueError("릴리즈 확인 시간은 0~2초, timeout은 확인 시간 초과~10초여야 합니다")
@@ -289,8 +297,7 @@ class GripperCtl:
             check()
         s0 = self._read_status()
         if s0 is not None and self._reached(s0, target_pct):
-            send_fn()  # 홀드 목표 갱신용 — 이동은 없음
-            return True
+            return bool(send_fn())  # 홀드 목표 갱신도 ACK 실패를 무시하지 않음
         for attempt in (1, 2):
             if check:
                 check()
@@ -415,6 +422,15 @@ class GripperCtl:
         width_mm = float(width_m) * 1000
         if not math.isfinite(width_mm) or width_mm < 0:
             raise ValueError("릴리즈 기준 폭은 유한한 0 이상의 값이어야 합니다")
+
+        def send_open():
+            if check:
+                check()
+            if time.monotonic() >= deadline:
+                print("경고: 릴리즈 명령 전송 기한 초과 — 복귀하지 않습니다")
+                return False
+            return self._set_raw_open_pct(100.0)
+
         released = False
         try:
             s = self._read_status()
@@ -428,16 +444,25 @@ class GripperCtl:
                 return False
             release_mm = min(self.stroke_mm, max(width_mm, start_pct * self.stroke_mm / 100)
                              + self.release_margin_mm)
-            release_pct = release_mm / self.stroke_mm * 100
-            # Fully open commonly reports 99.8%, not exactly 100%. Limit the
-            # tolerance to 0.5 mm and 10% of the requested release margin.
-            tolerance_pct = min(.5, self.release_margin_mm * .1) / self.stroke_mm * 100
+            # Full-stroke feedback can plateau at 98.9 mm on the 100 mm tool.
+            # Keep the tighter clearance tolerance for all non-saturated targets.
+            at_limit = release_mm == self.stroke_mm
+            clearance_tolerance_mm = min(.5, self.release_margin_mm * .1)
+            tolerance_mm = (self.release_full_open_tolerance_mm if at_limit else
+                            clearance_tolerance_mm)
+            threshold_mm = release_mm - tolerance_mm
+            start_mm = start_pct * self.stroke_mm / 100
+            maximum_mm = minimum_mm = start_mm
             command_started = time.monotonic()
-            if not self._move_cmd(lambda: self._set_raw_open_pct(100.0),
-                                  100.0, "릴리즈", check=check):
+            deadline = command_started + self.release_timeout_s
+            # One loop owns startup, direction, clearance and failure checks.
+            # The generic _move_cmd accepts motion in either direction, which
+            # cannot acknowledge an OPEN command during force-hold handover.
+            if not self._send_retry(send_open, "릴리즈"):
                 return False
-            deadline = time.monotonic() + self.release_timeout_s
-            reached_since = stall_since = None
+            start_deadline = time.monotonic() + CMD_START_TIMEOUT_S
+            retried = opening_seen = False
+            reached_since = stall_since = reverse_since = None
             last = None
             while time.monotonic() < deadline:
                 if check:
@@ -448,12 +473,28 @@ class GripperCtl:
                     return False
                 now = time.monotonic()
                 pct = self._pos_pct(s)
-                if not math.isfinite(pct) or not 0 <= pct <= 100 or pct < start_pct - .5:
-                    reason = ("위치 판독 범위 오류" if not math.isfinite(pct) or not 0 <= pct <= 100
-                              else "닫힘 방향 이동 감지")
-                    print(f"경고: 릴리즈 {reason} — 복귀하지 않습니다 "
+                if not math.isfinite(pct) or not 0 <= pct <= 100:
+                    print(f"경고: 릴리즈 위치 판독 범위 오류 — 복귀하지 않습니다 "
                           f"(시작 {start_pct:.2f}% → 현재 {pct:.2f}%, "
                           f"변화 {pct - start_pct:+.2f}%p, raw={s.finger_pos}, "
+                          f"명령 후 {now - command_started:.3f}s, "
+                          f"invert={self.invert}, {self._fmt_status(s)})")
+                    return False
+                width = pct * self.stroke_mm / 100
+                maximum_mm, minimum_mm = max(maximum_mm, width), min(minimum_mm, width)
+                if now >= deadline:
+                    break
+                opening_seen |= width > start_mm + MOVE_TOL_TICKS / 1000 * self.stroke_mm
+                reverse_mm = maximum_mm - width
+                if reverse_mm > RELEASE_REVERSE_DEADBAND_MM:
+                    reverse_since = now if reverse_since is None else reverse_since
+                else:
+                    reverse_since = None
+                if (reverse_mm > RELEASE_REVERSE_LIMIT_MM or
+                        (reverse_since is not None and now - reverse_since >= RELEASE_REVERSE_CONFIRM_S)):
+                    print(f"경고: 릴리즈 닫힘 방향 이동 감지 — 복귀하지 않습니다 "
+                          f"(시작 {start_pct:.2f}% → 현재 {pct:.2f}%, raw={s.finger_pos}, "
+                          f"최대 폭 대비 -{reverse_mm:.2f}mm, "
                           f"명령 후 {now - command_started:.3f}s, "
                           f"invert={self.invert}, {self._fmt_status(s)})")
                     return False
@@ -465,18 +506,39 @@ class GripperCtl:
                         return False
                 else:
                     stall_since = None
-                if pct >= release_pct - tolerance_pct:
+                # A nearly full endpoint with high current is not evidence of
+                # clearance: let the existing stall/timeout handling decide.
+                clear = (width >= threshold_mm and reverse_since is None
+                         and (not at_limit or (
+                             abs(s.motor_cur) <= STALL_CURRENT_MA and
+                             (opening_seen or start_mm >= self.stroke_mm - clearance_tolerance_mm))))
+                if clear:
                     reached_since = now if reached_since is None else reached_since
                     if now - reached_since >= self.release_confirm_s:
                         released = True
-                        row("릴리즈", f"기준 {release_mm:.1f} mm · 실측 {pct * self.stroke_mm / 100:.1f} mm"
+                        row("릴리즈", f"기준 {release_mm:.1f} mm · 실측 {width:.1f} mm"
                             " · 개방 계속 / 복귀 가능")
                         return True
                 else:
                     reached_since = None
+                # ACK without positive opening progress gets one retry. Never
+                # reset the overall deadline or bypass direction/fault checks.
+                if not opening_seen and not clear and now >= start_deadline:
+                    if retried:
+                        print(f"경고: 릴리즈 개방 시작 미감지 — 복귀하지 않습니다 "
+                              f"({self._fmt_status(s)})")
+                        return False
+                    if not send_open():
+                        print("경고: 릴리즈 재전송 실패 — 복귀하지 않습니다")
+                        return False
+                    retried = True
+                    start_deadline = time.monotonic() + CMD_START_TIMEOUT_S
                 last = s.finger_pos
                 time.sleep(.02)
-            print(f"경고: 릴리즈 폭 {release_mm:.1f}mm 도달 시간 초과 — 복귀하지 않습니다")
+            print(f"경고: 릴리즈 폭 {release_mm:.1f}mm 도달 시간 초과 — 복귀하지 않습니다 "
+                  f"(통과 기준 ≥{threshold_mm:.2f}mm, "
+                  f"측정 범위 {minimum_mm:.2f}~{maximum_mm:.2f}mm, "
+                  f"명령 후 {time.monotonic() - command_started:.2f}s, {self._fmt_status(s)})")
             return False
         finally:
             if not released:
@@ -485,39 +547,60 @@ class GripperCtl:
                 except Exception as exc:
                     print(f"경고: 릴리즈 실패 후 그리퍼 정지 실패 ({exc})")
 
-    def grip(self):
+    def grip(self, check=None):
         """닫아서 파지. 반환: (success, finger_pos_pct).
 
         이동 시작 검증(재전송 1회) 후, 접촉 정지가 정상이므로 잼 보호 없이
         정착만 기다린다 (파지 유지 전류 허용). position 모드에서는 0%(완전
         닫힘)를 목표로 걸어 물체에서 멈추게 한다.
 
-        방향 감시: close 후 위치가 '열림' 방향으로 5% 이상 움직이면 펌웨어
-        방향 손상이므로 즉시 원위치 명령으로 세우고 실패 반환한다.
+        빈 파지만 False를 반환한다. 구동·통신·정착 실패는 예외로 구분하여
+        파지 판정을 끈 실행에서도 상승하지 않게 한다. check는 닫힘 시작과
+        대기 중, 정착 후의 외부 로봇/카메라 상태를 검사한다.
         """
         send = ((lambda: self._set_raw_open_pct(0.0))
                 if self.grip_mode == "position" else self._cmd_close)
-        s0 = self._read_status()
-        p0 = None if s0 is None else self._pos_pct(s0)
-        if not self._move_cmd(send, 0.0, "파지(close)"):
-            return False, None
-        settled, s = self._wait_settle(jam_protect=False,
-                                       min_wait_s=self.close_min_wait_s)
-        if not settled:
-            # Do not lift while fingers are still moving, even with grip_check off.
-            raise RuntimeError("그리퍼 닫힘 안정화 실패 — 상승하지 않습니다")
-        if s is None or s.fault:
-            return False, None
-        pos = self._pos_pct(s)
-        if p0 is not None and pos >= p0 + 5.0:
-            self._set_raw_open_pct(pos)  # 열림 폭주 중단 (위치 명령이 우선함)
-            print(f"경고: close가 열림 방향으로 동작 ({p0:.1f}→{pos:.1f}%) — "
-                  "펌웨어 방향 손상. 버튼(I) 초기화 필요")
-            return False, round(pos, 1)
-        return pos > self.grip_success_min_pct, round(pos, 1)
+        try:
+            if check:
+                check()
+            s0 = self._read_status()
+            if s0 is None or s0.fault or not s0.enabled or s0.initialized:
+                raise RuntimeError(f"그리퍼 닫힘 시작 상태 오류 — 상승하지 않습니다 "
+                                   f"[{self._fmt_status(s0)}]")
+            p0 = self._pos_pct(s0)
+            if not math.isfinite(p0) or not 0 <= p0 <= 100:
+                raise RuntimeError("그리퍼 닫힘 시작 위치 판독 오류 — 상승하지 않습니다")
+            if not self._move_cmd(send, 0.0, "파지(close)", check=check):
+                raise RuntimeError("그리퍼 닫힘 명령/시작 확인 실패 — 상승하지 않습니다")
+            settled, s = self._wait_settle(jam_protect=False,
+                                           min_wait_s=self.close_min_wait_s, check=check)
+            if not settled or s is None or s.fault or not s.enabled or s.initialized:
+                raise RuntimeError(f"그리퍼 닫힘 안정화 실패 — 상승하지 않습니다 "
+                                   f"[{self._fmt_status(s)}]")
+            if check:
+                check()
+            pos = self._pos_pct(s)
+            if not math.isfinite(pos) or not 0 <= pos <= 100:
+                raise RuntimeError("그리퍼 닫힘 위치 판독 오류 — 상승하지 않습니다")
+            if pos >= p0 + 5.0:
+                raise RuntimeError(f"close가 열림 방향으로 동작 ({p0:.1f}→{pos:.1f}%) — "
+                                   "펌웨어 방향 손상. 버튼(I) 초기화 필요")
+            return pos > self.grip_success_min_pct, round(pos, 1)
+        except BaseException:
+            # Stop squeezing after an interrupted/failed close. Successful
+            # contact keeps firmware force-hold active for the subsequent lift.
+            try:
+                self.g.stop()
+            except Exception as exc:
+                print(f"경고: 닫힘 실패 후 그리퍼 정지 실패 ({exc})")
+            raise
 
     def status(self):
         return self._read_status()
+
+    def stop(self):
+        """Interrupt finger motion/force control without commanding an opening."""
+        return self.g.stop()
 
     def disconnect(self):
         self.g.disconnect()

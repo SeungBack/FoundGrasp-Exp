@@ -4,6 +4,7 @@
     world/robot/<link>     xArm7 메쉬 (MJCF 기구학, 로봇 관절각 폴링으로 실시간 갱신)
     world/robot/tcp        그리퍼 근사 형상 (본체·핑거 박스, 개방 폭 반영)
     world/camera           스캔 시 카메라 자세 · 점군 · 그립 후보(점수 색) · 선정 그립
+    world/live_clouds      이동 중 최신 N개 프레임 (프레임별 카메라 자세, 시각화 전용)
     world/targets          선정 그립의 pre-grasp / grasp TCP 목표 축
   2D  world/camera/image   컬러 + ROI + 후보 투영
   status / log / metrics    동작 단계, 실측 개방 폭, 검출 시간·후보 수 (성공 판정 미표시)
@@ -30,6 +31,7 @@ import numpy as np
 
 from .config import get
 from .postprocess import backproject
+from .se3 import xarm_pose_to_se3
 from .viz import gripper_segments_3d, score_colors, display_candidate_indices
 
 APP_ID = "exp_foundgrasp"
@@ -102,6 +104,12 @@ class RerunViz:
         self.rr = None
         self.cfg = cfg
         self._robot_thread = None
+        self._live_cloud_stream = None
+        self._live_cloud_history = get(cfg, "rerun.live_cloud_history", 0)
+        if (isinstance(self._live_cloud_history, bool)
+                or not isinstance(self._live_cloud_history, (int, np.integer))
+                or self._live_cloud_history < 0):
+            raise ValueError("rerun.live_cloud_history는 0 이상의 정수여야 합니다")
         self._stop = threading.Event()
         self._open_width = 0.05
         self._gripper_mesh_tcp = None
@@ -112,8 +120,19 @@ class RerunViz:
         self._epoch = time.monotonic()
         self._cycle = 0
         self._scan_K = None
-        self._tcp_offset = np.eye(4)
-        self._tcp_offset[2, 3] = float(get(cfg, "rerun.tcp_offset_m", 0.215))
+        tcp = get(cfg, "robot.tcp_offset_mm_deg")
+        if tcp is not None:
+            tcp = np.asarray(tcp, dtype=float).copy()
+            if tcp.shape != (6,) or not np.isfinite(tcp).all():
+                raise ValueError("robot.tcp_offset_mm_deg는 유한한 6개 값이어야 합니다")
+            tcp[3:] = np.radians(tcp[3:])
+            self._tcp_offset = xarm_pose_to_se3(tcp)
+        else:
+            self._tcp_offset = np.eye(4)
+            self._tcp_offset[2, 3] = float(get(cfg, "rerun.tcp_offset_m", 0.215))
+        self._tip_length_m = float(get(cfg, "gripper.tip_length_mm", 80.)) / 1000
+        if not np.isfinite(self._tip_length_m) or self._tip_length_m <= 0:
+            raise ValueError("gripper.tip_length_mm는 유한한 양수여야 합니다")
         if not get(cfg, "rerun.enabled", True):
             return
         import rerun as rr
@@ -193,13 +212,14 @@ class RerunViz:
         rr = self.rr
         self._stamp()
         tcp_z = float(self._tcp_offset[2, 3])
-        if self._gripper_mesh_tcp != tcp_z:
+        geometry = (tcp_z, self._tip_length_m)
+        if self._gripper_mesh_tcp != geometry:
             from .gripper_visual import gripper_parts
-            for name, mesh, color in gripper_parts(tcp_z):
+            for name, mesh, color in gripper_parts(tcp_z, self._tip_length_m):
                 rr.log(f"world/robot/tcp/gripper/{name}", rr.Mesh3D(
                     vertex_positions=mesh.vertices, triangle_indices=mesh.faces,
                     vertex_normals=mesh.vertex_normals, albedo_factor=[c/255 for c in color]))
-            self._gripper_mesh_tcp = tcp_z
+            self._gripper_mesh_tcp = geometry
         for name, sign in (("left", 1), ("right", -1)):
             rr.log(f"world/robot/tcp/gripper/{name}", rr.Transform3D(
                 translation=[0, sign*self._open_width/2, 0]))
@@ -288,6 +308,56 @@ class RerunViz:
 
         self._robot_thread = threading.Thread(target=loop, daemon=True)
         self._robot_thread.start()
+
+    def start_live_cloud_stream(self, camera, robot, T_flange_cam):
+        """Add a display-only stream; detector snapshots keep their own frame."""
+        if self.rr is None or self._live_cloud_history == 0:
+            return
+        if self._live_cloud_stream is not None:
+            raise RuntimeError("라이브 점군 스트림이 이미 시작되었습니다")
+        from .live_pointcloud import LivePointCloudStream
+        stream = LivePointCloudStream(
+            self, camera, robot, T_flange_cam,
+            history=self._live_cloud_history,
+            hz=get(self.cfg, "rerun.live_cloud_hz", 5.),
+            stride=get(self.cfg, "rerun.live_cloud_stride", 4))
+        try:
+            stream.start()
+        except Exception as exc:
+            try:
+                stream.close()
+            except Exception as cleanup_error:
+                print(f"라이브 점군 정리 실패: {cleanup_error}", flush=True)
+            message = f"라이브 점군 시작 실패: {exc}"
+            print(message, flush=True)
+            self.log_text(message, level="WARN")
+            return
+        self._live_cloud_stream = stream
+        row("라이브 점군", f"최근 {self._live_cloud_history}프레임 · "
+            f"{get(self.cfg, 'rerun.live_cloud_hz', 5):g} Hz · 파지용 스캔 별도 유지")
+
+    def log_live_cloud(self, rgb, depth_m, K, T_base_cam, slot, captured_at):
+        """One bounded history slot in its own capture frame, never under camera."""
+        if self.rr is None:
+            return
+        if not 0 <= slot < self._live_cloud_history:
+            raise ValueError("라이브 점군 슬롯이 설정한 이력 범위를 벗어났습니다")
+        depth = np.where(np.isfinite(depth_m) & (depth_m > 0), depth_m, 0.)
+        valid = depth > 0
+        pts = backproject(depth, K)
+        self._stamp()
+        self.rr.log(f"world/live_clouds/frame_{slot}",
+                    self.rr.Transform3D(translation=T_base_cam[:3, 3],
+                                        mat3x3=T_base_cam[:3, :3]),
+                    self.rr.Points3D(pts, colors=rgb[valid],
+                                    radii=float(get(self.cfg, "rerun.point_radius_m", .0005))))
+        self.rr.log("metrics/live_cloud_age_ms", self.rr.Scalars(
+            max(0., time.monotonic() - captured_at) * 1000))
+
+    def clear_live_clouds(self):
+        if self.rr is not None:
+            self._stamp()
+            self.rr.log("world/live_clouds", self.rr.Clear(recursive=True))
 
     # ------------------------------------------------------------ 사이클
     def set_cycle(self, n):
@@ -410,6 +480,12 @@ class RerunViz:
         self.log_stage("Stopped" if outcome == "abort" else "Cycle complete")
 
     def close(self):
+        if self._live_cloud_stream is not None:
+            try:
+                self._live_cloud_stream.close()
+            except Exception as exc:
+                print(f"라이브 점군 종료 실패: {exc}", flush=True)
+            self._live_cloud_stream = None
         self._stop.set()
         if self._robot_thread is not None:
             self._robot_thread.join(timeout=1)

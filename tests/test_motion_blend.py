@@ -22,6 +22,7 @@ def setup(monkeypatch):
     robot.get_tcp_pose.side_effect = lambda: (
         grasp if robot.arm.set_position.call_count == 2 else start, None)
     robot.arm.set_position.return_value = 0
+    robot.arm.mode = 0
     robot.arm.get_state.return_value = (0, 2)
     robot.arm.get_err_warn_code.return_value = (0, [0, 0])
     robot.arm.get_cmdnum.return_value = (0, 0)
@@ -34,11 +35,48 @@ def test_queues_blend_then_exact_stop_and_waits_for_settle(setup):
     p = setup
     assert motion.approach_blended(p.robot, p.pre, p.grasp, p.cfg)
     first, last = p.robot.arm.set_position.call_args_list
-    assert first.kwargs == dict(speed=700., mvacc=500., radius=5., is_radian=True, wait=False)
-    assert last.kwargs == dict(speed=150., mvacc=500., radius=-1, is_radian=True, wait=False)
+    assert first.kwargs == dict(speed=700., mvacc=500., mvtime=0, radius=5.,
+                                is_radian=True, wait=False, only_check_type=0)
+    assert last.kwargs == dict(speed=150., mvacc=500., mvtime=0, radius=-1,
+                               is_radian=True, wait=False, only_check_type=0)
     assert last.args[:3] == (0., 0., 100.)  # TCP, metres -> mm, no double offset
     assert p.clock[0] >= .2
     p.robot.stop_motion.assert_not_called()
+
+
+def test_approach_executes_accepted_commands_without_recomputing_limits(setup):
+    from dataclasses import replace
+    p = setup
+    start, _ = p.robot.get_tcp_pose()
+    commands = tuple(replace(c, speed=c.speed * .8, acceleration=c.acceleration * .64)
+                     for c in motion.approach_commands(start, p.pre, p.grasp, p.cfg))
+    p.cfg.update(travel_speed_mm_s=999, approach_speed_mm_s=999, approach_acc_mm_s2=999)
+    assert motion.approach_blended(p.robot, p.pre, p.grasp, p.cfg, commands=commands)
+    for command, call in zip(commands, p.robot.arm.set_position.call_args_list):
+        np.testing.assert_allclose(call.args, command.target)
+        assert call.kwargs['speed'] == command.speed
+        assert call.kwargs['mvacc'] == command.acceleration
+        assert call.kwargs['radius'] == command.radius
+
+
+def test_approach_rejects_checked_commands_for_a_different_target(setup):
+    p = setup
+    start, _ = p.robot.get_tcp_pose()
+    commands = motion.approach_commands(start, p.pre, p.grasp, p.cfg)
+    changed = p.grasp.copy()
+    changed[0, 3] += .01
+    assert not motion.approach_blended(p.robot, p.pre, changed, p.cfg, commands=commands)
+    p.robot.arm.set_position.assert_not_called()
+
+
+@pytest.mark.parametrize('reply', [(0, [0.] * 6 + [91.]), (0, [0.] * 6),
+                                  (0, ['bad'] * 7), (9, [0.] * 7)])
+def test_approach_measured_joint_failure_stops_without_error_reset(setup, reply):
+    p = setup
+    p.robot.arm.get_servo_angle.return_value = reply
+    assert not motion.approach_blended(p.robot, p.pre, p.grasp, p.cfg, j7_limits=(-89., 90.))
+    p.robot.stop_motion.assert_called_once()
+    p.robot.arm.clean_error.assert_not_called()
 
 
 @pytest.mark.parametrize("ready", [True, False])
@@ -127,7 +165,13 @@ def test_controller_fault_stops_and_short_leg_limits_radius(setup):
 
 
 @pytest.fixture
-def transfer(setup):
+def transfer(setup, monkeypatch):
+    # These unit tests isolate execution/barriers. Native check call ordering
+    # and exact command identity are covered by test_stopped_transfer.py.
+    monkeypatch.setattr(transfer_plan, 'preflight_with_retiming',
+                        lambda arm, commands, **kwargs: (commands, 1.))
+    monkeypatch.setattr(motion, 'preflight_with_retiming',
+                        lambda arm, commands, **kwargs: (commands, 1.))
     p = setup
     p.pre[2, 3] = .5
     p.robot.R_home_tcp = np.diag([1., -1., -1.])
@@ -230,6 +274,7 @@ def test_retreat_and_reorientation_use_distinct_speeds(transfer):
     p = transfer
     p.cfg.update(retreat_speed_mm_s=140, reorient_speed_mm_s=80,
                  reorient_acc_mm_s2=125, reorient_angular_speed_deg_s=20)
+    p.plan = transfer_plan.prepare_transfer(p.robot, p.pre, p.lift, p.cfg, p.drop)
     assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     retreat, rise = p.robot.arm.set_position.call_args_list
     assert retreat.kwargs["speed"] == 140
@@ -264,6 +309,7 @@ def test_stopped_short_of_upper_target_never_queues_joint_motion(transfer):
 def test_joint_acceleration_is_configurable_and_stage_starts_after_stop(transfer):
     p = transfer
     p.drop["joint_acc_deg_s2"] = 100
+    p.plan = transfer_plan.prepare_transfer(p.robot, p.pre, p.lift, p.cfg, p.drop)
     stages = []
 
     def stage(name):
@@ -273,14 +319,15 @@ def test_joint_acceleration_is_configurable_and_stage_starts_after_stop(transfer
 
     assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop, on_stage=stage)
     assert p.robot.arm.set_servo_angle.call_args.kwargs["mvacc"] == 100
-    assert stages == ["Joint transfer"]
+    assert stages == ["Preparing joint transfer", "Joint transfer"]
 
 
 @pytest.mark.parametrize("value", [0, -1, float("nan")])
 def test_invalid_transfer_acceleration_prevents_any_move(transfer, value):
     p = transfer
     p.drop["joint_acc_deg_s2"] = value
-    assert not motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
+    with pytest.raises(ValueError, match='acceleration'):
+        transfer_plan.prepare_transfer(p.robot, p.pre, p.lift, p.cfg, p.drop)
     p.robot.arm.set_position.assert_not_called()
     p.robot.arm.set_servo_angle.assert_not_called()
 
@@ -309,6 +356,7 @@ def test_short_transfer_confirmation_preserves_stop_barrier(transfer, monkeypatc
     monkeypatch.setattr(motion.time, "perf_counter", lambda: p.clock[0])
     p.drop.update(transfer_confirm_s=.1, arrival_confirm_s=.05)
     p.cfg["retreat_blend_radius_mm"] = 10
+    p.plan = transfer_plan.prepare_transfer(p.robot, p.pre, p.lift, p.cfg, p.drop)
 
     def joint_command(**kwargs):
         assert .1 <= p.clock[0] < .2
@@ -345,8 +393,8 @@ def test_invalid_confirmation_prevents_motion(transfer, value, key):
 def test_retreat_rounding_is_limited_by_clearance(transfer, radius, expected):
     p = transfer
     p.pre[2, 3] = .41  # Only 10 mm above initial TCP.
-    p.plan = transfer_plan.prepare_transfer(p.robot, p.pre, p.lift, p.cfg, p.drop)
     p.cfg["retreat_blend_radius_mm"] = radius
+    p.plan = transfer_plan.prepare_transfer(p.robot, p.pre, p.lift, p.cfg, p.drop)
     assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     assert p.robot.arm.set_position.call_args_list[0].kwargs["radius"] == pytest.approx(expected)
 
