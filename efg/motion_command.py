@@ -106,9 +106,10 @@ def approach_commands(start, pre, grasp, cfg):
     radius = min(radius, min(lengths) * 250)
     radius = radius if radius > .01 else -1
     acceleration = float(cfg.get('approach_acc_mm_s2', 500))
+    travel_acceleration = float(cfg.get('travel_acc_mm_s2', acceleration))
     return (
         MotionCommand('cartesian', tuple(se3_to_xarm_pose(pre)),
-                      float(cfg['travel_speed_mm_s']), acceleration, radius, 'pre-grasp'),
+                      float(cfg['travel_speed_mm_s']), travel_acceleration, radius, 'pre-grasp'),
         MotionCommand('cartesian', tuple(se3_to_xarm_pose(grasp)),
                       float(cfg['approach_speed_mm_s']), acceleration, -1, '접근'),
     )
@@ -149,29 +150,51 @@ def preflight_commands(arm, commands, check=None):
 def preflight_with_retiming(arm, commands, *, check_start, check=None):
     """Bounded command-limit scaling for native overspeed rejections only.
 
-    Scale all connected segments together (v*s, a*s²), keeping geometry and
-    blend radii unchanged. The controller still owns jerk/trajectory generation;
-    this is not a proof of exact time-scaled or collision-free motion.
+    Positive outgoing radii connect commands into a phase; zero/negative radii
+    end a phase at an exact stop. Retiming scales only the rejected phase, using
+    its original limits (v*s, a*s²), with geometry and blend radii unchanged.
+    Every reduction still checks the ENTIRE chain: the native shadow trajectory
+    must begin at the actual state, not at an unexecuted intermediate waypoint.
+    The returned scale is the minimum phase scale, not a common chain scale.
+
+    Each phase permits three reductions, bounding attempts at 1 + 3 * phases.
+    The controller still owns jerk/trajectory generation; this is not a proof
+    of exact time-scaled or collision-free motion.
     check_start must reject changed, moving or faulted actual robot states.
     Every attempt restarts the native shadow chain at the actual stopped state.
     """
     original = tuple(commands)
-    for scale in (1., .8, .6, .5):
+    if not original or not all(isinstance(command, MotionCommand) for command in original):
+        raise ValueError('사전 검사에는 하나 이상의 MotionCommand가 필요합니다')
+    phase_for_command = [0]
+    for previous in original[:-1]:
+        phase_for_command.append(phase_for_command[-1] + (previous.radius <= 0))
+    levels = (1., .8, .6, .5)
+    phase_levels = [0] * (phase_for_command[-1] + 1)
+    while True:
         if check:
             check()
         check_start()
-        candidate = (original if scale == 1. else tuple(
-            replace(command, speed=command.speed * scale,
-                    acceleration=command.acceleration * scale ** 2)
-            for command in original))
+        phase_scales = [levels[level] for level in phase_levels]
+        candidate = tuple(
+            command if phase_scales[phase] == 1. else replace(
+                command, speed=command.speed * phase_scales[phase],
+                acceleration=command.acceleration * phase_scales[phase] ** 2)
+            for command, phase in zip(original, phase_for_command))
         try:
             preflight_commands(arm, candidate, check=check)
         except MotionCheckError as exc:
-            exc.speed_scale = scale
-            if not exc.is_overspeed or scale == .5:
+            index = exc.command_index
+            valid_index = (isinstance(index, Integral) and not isinstance(index, bool)
+                           and 0 <= index < len(original))
+            phase = phase_for_command[index] if valid_index else None
+            exc.speed_scale = phase_scales[phase] if valid_index else min(phase_scales)
+            if (not exc.is_overspeed or not valid_index
+                    or phase_levels[phase] == len(levels) - 1):
                 raise
+            phase_levels[phase] += 1
         else:
             if check:
                 check()
             check_start()
-            return candidate, scale
+            return candidate, min(phase_scales)

@@ -55,6 +55,20 @@ def tcp_ik_joints(robot, T_tcp, label, j7_limits=None):
     return q
 
 
+def _command_limits_snapshot(commands, nominal):
+    """Keep original ceilings beside accepted limits without changing the path."""
+    nominal = tuple(commands if nominal is None else nominal)
+    if len(nominal) != len(commands):
+        raise ValueError('원본 명령과 검사된 명령의 개수가 다릅니다')
+    for accepted, original in zip(commands, nominal):
+        if (accepted.kind != original.kind or accepted.target != original.target
+                or accepted.radius != original.radius or accepted.label != original.label
+                or accepted.speed > original.speed + 1e-9
+                or accepted.acceleration > original.acceleration + 1e-9):
+            raise ValueError('검사된 명령은 원본 경로와 같고 속도·가속도 상한 이하여야 합니다')
+    return nominal
+
+
 @dataclass(frozen=True)
 class TransferRoute:
     """Geometric route and immutable commands, before tying it to live state."""
@@ -64,6 +78,7 @@ class TransferRoute:
     transfer_sign: int
     commands: tuple
     start: np.ndarray | None = None
+    nominal_commands: tuple | None = None
 
     def __post_init__(self):
         for name in ('pre', 'upper', 'start'):
@@ -83,6 +98,8 @@ class TransferRoute:
             if not np.allclose(xarm_pose_to_se3(command.target), target, atol=1e-8, rtol=0):
                 raise ValueError('복귀 경로 자세와 명령 목표가 일치하지 않습니다')
         object.__setattr__(self, 'commands', commands)
+        object.__setattr__(self, 'nominal_commands',
+                           _command_limits_snapshot(commands, self.nominal_commands))
 
 
 @dataclass(frozen=True)
@@ -96,6 +113,7 @@ class TransferPlan:
     j7_limits: tuple | None = None
     speed_scale: float = 1.
     route_name: str = 'configured'
+    nominal_commands: tuple | None = None
 
     def __post_init__(self):
         for name in ('start_tcp', 'start_joints', 'pre', 'upper'):
@@ -103,6 +121,8 @@ class TransferPlan:
             value.setflags(write=False)
             object.__setattr__(self, name, value)
         object.__setattr__(self, 'commands', tuple(self.commands))
+        object.__setattr__(self, 'nominal_commands',
+                           _command_limits_snapshot(self.commands, self.nominal_commands))
         if self.j7_limits is not None:
             object.__setattr__(self, 'j7_limits', tuple(self.j7_limits))
 
@@ -125,14 +145,25 @@ class TransferPlan:
 
 def prepare_transfer(robot, T_pre, T_lift, robot_cfg, drop_cfg, *, transfer_sign=1,
                      j7_limits=None, camera_up=None, allow_symmetry=False, check=None,
-                     preferred_route=None):
+                     preferred_route=None, planning_j7_limits=None):
     """Search return routes from measured state before closing or enqueueing.
 
     A check-only rejection may try another geometric route while the real arm
     remains unchanged and healthy. Actual faults and transport errors propagate.
     The grasp/pre-grasp geometry and clearance height never change in this search.
+    planning_j7_limits reserves wrist travel at the actual grasp and Cartesian
+    IK samples. j7_limits remains the hard limit for real state and execution.
     """
     transfer_signs(drop_cfg, transfer_sign, allow_symmetry=allow_symmetry)
+    if planning_j7_limits is None:
+        planning_j7_limits = j7_limits
+    if planning_j7_limits is not None:
+        limits = np.asarray(planning_j7_limits, dtype=float)
+        if (limits.shape != (2,) or not np.isfinite(limits).all() or limits[0] >= limits[1]
+                or (j7_limits is not None and
+                    (limits[0] < j7_limits[0] or limits[1] > j7_limits[1]))):
+            raise ValueError('planning_j7_limits는 J7 실제 한계 안의 유한한 증가 범위여야 합니다')
+        planning_j7_limits = tuple(limits)
     if check:
         check()
     _require_stopped(robot)
@@ -147,8 +178,17 @@ def prepare_transfer(robot, T_pre, T_lift, robot_cfg, drop_cfg, *, transfer_sign
     if T_pre[2, 3] <= current[2, 3]:
         raise RuntimeError('after-grasp 복귀 목표가 현재 위치보다 높지 않습니다')
     guard = TransferPlan(current, joints, T_pre, T_pre, transfer_sign, j7_limits=j7_limits)
+    if (planning_j7_limits is not None and
+            not planning_j7_limits[0] <= joints[6] <= planning_j7_limits[1]):
+        if check:
+            check()
+        guard.check_start(robot)
+        raise PlanRejected(
+            f'실측 J7 {joints[6]:.2f}°: 복귀 계획 여유 범위 '
+            f'[{planning_j7_limits[0]:g}, {planning_j7_limits[1]:g}]° 밖 '
+            '— 그리퍼 닫힘 전 재선정 필요')
     try:
-        tcp_ik_joints(robot, T_pre, '복귀 pre-grasp', j7_limits)
+        tcp_ik_joints(robot, T_pre, '복귀 pre-grasp', planning_j7_limits)
     except _PathIKError as exc:
         if check:
             check()
@@ -161,18 +201,21 @@ def prepare_transfer(robot, T_pre, T_lift, robot_cfg, drop_cfg, *, transfer_sign
         transfer_sign=transfer_sign, allow_symmetry=allow_symmetry,
         preferred_route=preferred_route)
     for route in routes:
-        if route.commands[0] in rejected_retreats:
+        if route.nominal_commands[0] in rejected_retreats:
             continue  # The same first command has no knowledge of later waypoints.
         if check:
             check()
-        reason = route_path_error(robot, route, robot_cfg, j7_limits, camera_up, check)
+        reason = route_path_error(robot, route, robot_cfg, planning_j7_limits, camera_up, check)
         if reason:
             if check:
                 check()
             guard.check_start(robot)
             failures.append(f'상승 {route.transfer_sign:+d}: {reason} [경로={route.name}]')
             continue
-        commands = route.commands
+        # This is a new plan at the measured, stopped grasp pose. Re-evaluate
+        # the original ceilings rather than compound a hypothetical scan-state
+        # reduction. Only the newly accepted commands may subsequently execute.
+        commands = route.nominal_commands
         if j7_limits is not None and not j7_limits[0] <= commands[-1].target[6] <= j7_limits[1]:
             raise RuntimeError('릴리즈 목표 J7 제한 초과')
         plan = TransferPlan(current, joints, T_pre, route.upper, route.transfer_sign,
@@ -188,7 +231,7 @@ def prepare_transfer(robot, T_pre, T_lift, robot_cfg, drop_cfg, *, transfer_sign
                 raise
             failures.append(f'상승 {route.transfer_sign:+d}: {exc} [경로={route.name}]')
             if exc.command_index == 0:
-                rejected_retreats.add(route.commands[0])
+                rejected_retreats.add(route.nominal_commands[0])
             continue
         plan = replace(plan, commands=commands, speed_scale=scale)
         plan.check_start(robot)
@@ -324,8 +367,8 @@ def transfer_route_candidates(current, T_pre, T_lift, robot_cfg, drop_cfg, R_hom
     routes = []
 
     def append(route):
-        # Keep a preferred, already retimed command sequence rather than replace
-        # it with a faster reconstruction having the same path geometry.
+        # Preserve the preferred path and its original/accepted limit snapshots.
+        # Do not reconstruct either snapshot from possibly changed config.
         for old in routes:
             if len(old.commands) == len(route.commands) and all(
                     a.kind == b.kind and abs(a.radius - b.radius) < 1e-7

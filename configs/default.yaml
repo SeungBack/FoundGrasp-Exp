@@ -82,22 +82,22 @@ robot:
   home_joints_deg: [-11.18, -22.16, -17.76, 77.08, -6.72, 98.24, -28.69]
   home_joint_speed_deg_s: 180 # 홈 복귀 조인트 속도 (deg/s), SDK 1.18.4 명령 상한
   home_joint_acc_deg_s2: 450  # 홈 복귀 가속도 (deg/s²)
-  travel_speed_mm_s: 900     # 홈 -> pre-grasp 이동 속도 (mm/s)
-  lift_speed_mm_s: 900       # 복귀·자세 전환 공통 속도 상한 (mm/s)
-  retreat_speed_mm_s: 750    # 파지 후 pre-grasp 복귀 속도 상한
-  reorient_speed_mm_s: 900   # pre-grasp 이후 상승 속도 상한 (grasp 모드는 파지 방향 유지)
+  travel_speed_mm_s: 1000    # 홈 -> pre-grasp 이동 속도 상한 (mm/s)
+  travel_acc_mm_s2: 1800     # 홈 -> pre-grasp 가속도; 잡기 직전 접근 가속도와 분리
+  lift_speed_mm_s: 1000      # 복귀·자세 전환 공통 속도 상한 (mm/s)
+  retreat_speed_mm_s: 850    # 파지 후 pre-grasp 복귀 속도 상한
+  reorient_speed_mm_s: 1000  # pre-grasp 이후 상승 속도 상한 (grasp 모드는 파지 방향 유지)
   reorient_angular_speed_deg_s: 300 # 회전량/이동거리 기반 속도 산정 기준 (관절 속도 보장은 아님)
-  reorient_acc_mm_s2: 1200   # 자세 전환 구간 가속도
+  reorient_acc_mm_s2: 1800   # pre-grasp 이후 상승·자세 전환 가속도
   rise_ik_step_mm: 20       # 상승 중간 자세 IK 검사 간격 (경로/특이점 통과 보장은 아님)
   rise_ik_step_deg: 5       # 병진·회전 중 더 촘촘한 간격 사용; 선정 시와 상승 전 재검사
-  lift_acc_mm_s2: 600        # 파지 후 pre-grasp 복귀 가속도; 자유 공간 상승보다 낮게 유지
-  approach_speed_mm_s: 500   # pre-grasp -> grasp 접근 속도 (mm/s)
-  approach_acc_mm_s2: 1100   # 연속 pre-grasp/접근 명령의 가속도
+  lift_acc_mm_s2: 800        # 파지 후 pre-grasp 복귀 가속도; 자유 공간 상승보다 낮게 유지
+  approach_speed_mm_s: 250   # 잡기 직전 pre-grasp -> grasp 구간만 감속 (mm/s)
+  approach_acc_mm_s2: 1100   # 잡기 직전 pre-grasp -> grasp 가속도
   pregrasp_blend_radius_mm: 20 # pre-grasp 통과 반경; 양쪽 구간 길이의 1/4 이하로 제한
   retreat_blend_radius_mm: 50 # 복귀 -> 상승 경유점 통과 반경; 길이의 1/4 이하로 제한
   approach_confirm_s: 0.05   # 파지점 도착·정지·빈 큐 연속 확인 시간 (0.04~1초)
   approach_timeout_s: 60     # 연속 접근 완료 대기 한도
-  default_acc_mm_s2: 1000     # --confirm 모드에서 접근 후 복원할 기본 가속도
   # tcp_payload: {weight_kg: 1.9, com_mm: [7, 1, 48]}   # 지정 시 연결마다 컨트롤러에 설정
 
 # ---------------------------------------------------------------- 카메라 (D435)
@@ -127,6 +127,7 @@ gripper:
   close_min_wait_s: 0.15     # 닫힘 시작 확인 후 최소 대기; 연속 3회 위치 안정도 필요
   open_min_wait_s: 0.2       # full 모드/연결 점검의 완전 개방 최소 대기; 도달·정지 확인 유지
   pre_open_min_wait_s: 0.15  # pre-grasp 폭 조절 최소 대기; 도달·정지 확인 유지
+  pre_open_reconnect_timeout_s: 3.0 # 폭 조절 통신 실패 시 포트 재연결 시도 한도; 정상 확인 후 1회 재전송 (0=끔)
   release_mode: width        # width: 놓을 폭까지만 확인 후 복귀 / full: 완전 개방·정착 대기
   release_margin_mm: 5       # max(선정 개방 폭, 현재 파지 폭) + 여유 (전체 stroke 이하)
   release_confirm_s: 0.1    # 기준 폭 이상을 유지하는 시간; 시간만으로 놓았다고 판정하지 않음
@@ -148,18 +149,18 @@ selection:
   approach_max_tilt_deg: 25     # 접근 방향과 수직(base -z)의 최대 각도. 29°에서 self-collision 실측
   pre_grasp_offset_m: 0.10      # 접근 방향 반대로 물러난 pre-grasp 거리
   use_grasp_depth: true         # 검출기가 예측한 그립별 depth 반영
-  approach_extra_m: 0.047      # 추가 삽입 47mm (+ 예측 depth). 팁 길이는 robot.tcp_offset_mm_deg로 보정
+  approach_extra_m: 0.045      # 추가 삽입 45mm (+ 예측 depth). 팁 길이는 robot.tcp_offset_mm_deg로 보정
   lift_height_m: 0.1           # 높은 이송 경유점의 최소 높이 = grasp z + 이 값
   ik_check_per_candidate: true
   j7_limit_deg: [-89, 90]       # 파지·상승 대칭 후보 모두에 적용하는 J7 허용 범위 (케이블 꼬임 방지)
-  j7_selection_margin_deg: 10 # 선정 IK는 [-79,80]° 사용; 실제 파지 자세에서의 IK 차이에 대비한 여유
+  j7_selection_margin_deg: 10 # 선정·파지점 재계획은 [-79,80]°; 실측도 여유 부족 시 닫기 전 재선정
   camera_up:                    # 손목 카메라 하향 자세 배제 (바닥·박스 충돌 방지)
     prefer: true                # 카메라 하향 제한 적용; 경로 관절비용 동률이면 상향 우선
     max_down_deg: 20            # 카메라 측면 방향이 수평 아래로 이보다 기울면 탈락
 
 # ---------------------------------------------------------------- 작업 장면
 # 스캔 영역 (컬러 이미지 픽셀 [x1, y1, x2, y2]) — 물체 박스 내부. scripts/set_roi.py 로 지정
-scan_roi_px: [300, 11, 1093, 712]
+scan_roi_px: [300, 100, 1000, 620]
 
 # 릴리즈(놓는 박스 상방) 자세 — scripts/teach_drop.py 로 티칭
 drop:

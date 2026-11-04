@@ -163,7 +163,7 @@ def test_transport_or_unknown_result_does_not_try_another_route(scene, code, res
     assert_checks_only(scene)
 
 
-def test_full_chain_retiming_keeps_exact_accepted_approach_and_transfer_commands(scene):
+def test_full_chain_retiming_only_slows_connected_rise_and_preserves_nominal_transfer(scene):
     first = [True]
     def reject_once(kind, args, kw):
         if first[0] and kind == 'cartesian' and args[2] == 360:
@@ -175,13 +175,19 @@ def test_full_chain_retiming_keeps_exact_accepted_approach_and_transfer_commands
     assert plan.speed_scale == .8
     original = approach_commands(scene.start, scene.pre, scene.grasp, scene.cfg['robot']) + scene.routes[0].commands
     accepted = plan.approach_commands + plan.transfer_route.commands
-    for nominal, actual, written in zip(original, accepted, scene.arm.writes[-5:]):
-        assert actual.speed == pytest.approx(nominal.speed * .8)
-        assert actual.acceleration == pytest.approx(nominal.acceleration * .64)
+    scales = (1., 1., .8, .8, 1.)
+    for nominal, actual, written, scale in zip(original, accepted, scene.arm.writes[-5:], scales):
+        assert actual.speed == pytest.approx(nominal.speed * scale)
+        assert actual.acceleration == pytest.approx(nominal.acceleration * scale ** 2)
         assert actual.target == nominal.target and actual.radius == nominal.radius
         assert written[2]['speed'] == actual.speed
         assert written[2]['mvacc'] == actual.acceleration
         assert written[2]['mvtime'] == 0
+    assert plan.transfer_route.nominal_commands == scene.routes[0].commands
+    scene.cfg['robot']['lift_speed_mm_s'] = 1000.
+    scene.cfg['drop']['joint_speed_deg_s'] = 180.
+    assert plan.transfer_route.nominal_commands[1].speed == 660.
+    assert plan.transfer_route.nominal_commands[-1].speed == 135.
     assert_checks_only(scene)
 
 
@@ -235,7 +241,7 @@ def test_release_joint_outside_hard_limit_is_not_a_retryable_grasp_failure(scene
     from dataclasses import replace
     route = scene.routes[0]
     commands = (*route.commands[:-1], replace(route.commands[-1], target=[0.] * 6 + [91.]))
-    invalid = replace(route, commands=commands)
+    invalid = replace(route, commands=commands, nominal_commands=commands)
     monkeypatch.setattr(pick_plan, 'transfer_route_candidates', lambda *a, **kw: [invalid])
     with pytest.raises(RuntimeError, match='릴리즈 목표 J7') as caught:
         prepare(scene)

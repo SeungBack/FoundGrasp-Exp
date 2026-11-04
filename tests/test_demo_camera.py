@@ -81,7 +81,7 @@ def test_clean_late_plan_rejection_returns_before_close_and_reselects(
     p = setup_pick
     p.cfg['selection'] = {'j7_limit_deg': [-89, 90]}
     planned = SimpleNamespace(check_start=Mock(), approach_commands=('pre', 'grasp'),
-                              transfer_route=object())
+                              transfer_route=object(), speed_scale=1.)
     p.selected.pick_plan = planned
     approach = Mock(return_value=True)
     transfer = Mock(side_effect=PlanRejected('native check C21; all routes unavailable'))
@@ -103,7 +103,7 @@ def test_actual_fault_after_approach_does_not_attempt_automatic_recovery(setup_p
     p = setup_pick
     p.cfg['selection'] = {'j7_limit_deg': [-89, 90]}
     p.selected.pick_plan = SimpleNamespace(check_start=Mock(), approach_commands=('pre', 'grasp'),
-                                          transfer_route=object())
+                                          transfer_route=object(), speed_scale=1.)
     monkeypatch.setattr(demo, 'approach_blended', Mock(return_value=True))
     monkeypatch.setattr(demo, 'prepare_transfer', Mock(side_effect=RuntimeError('actual C31')))
     recovery = Mock()
@@ -112,6 +112,35 @@ def test_actual_fault_after_approach_does_not_attempt_automatic_recovery(setup_p
                                auto=True, stream=p.stream)[0] == 'abort'
     recovery.assert_not_called()
     p.gripper.grip.assert_not_called()
+
+
+@pytest.mark.parametrize('actual_j7,expected,recover', [
+    (88.514187, 'replan', True), (90.067247, 'abort', False),
+])
+def test_measured_grasp_reserve_is_checked_before_closing(
+        setup_pick, monkeypatch, actual_j7, expected, recover):
+    p = setup_pick
+    p.cfg['selection'] = {'j7_limit_deg': [-89., 90.], 'j7_selection_margin_deg': 10.}
+    p.selected.pick_plan = SimpleNamespace(
+        check_start=Mock(), approach_commands=('pre', 'grasp'),
+        transfer_route=object(), speed_scale=1.)
+    p.robot.get_joints_deg.return_value = [0.] * 6 + [actual_j7]
+    # Keep real prepare_transfer: this verifies propagation of the planning
+    # reserve from the application, not only a mocked rejection branch.
+    monkeypatch.setattr(demo, 'approach_blended', Mock(return_value=True))
+    recovery = Mock(return_value=True)
+    monkeypatch.setattr(demo, 'recover_unclosed_pick', recovery)
+    result, _ = demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                                     auto=True, stream=p.stream)
+    assert result == expected
+    assert recovery.call_count == int(recover)
+    if recover:
+        assert recovery.call_args.kwargs['j7_limits'] == [-89., 90.]
+    p.gripper.grip.assert_not_called()
+    p.gripper.release.assert_not_called()
+    p.robot.arm.set_position.assert_not_called()
+    p.robot.arm.set_servo_angle.assert_not_called()
+    p.robot.arm.clean_error.assert_not_called()
 
 
 @pytest.mark.parametrize('failure', ['c31', 'state', 'mode', 'joint_limit',
@@ -126,7 +155,7 @@ def test_preopen_monitors_moving_robot_and_never_queues_approach_on_fault(
     start = p.selected.T_tcp_pre.copy()
     start[2, 3] += .2
     p.selected.pick_plan = SimpleNamespace(
-        check_start=Mock(), transfer_route=object(),
+        check_start=Mock(), transfer_route=object(), speed_scale=1.,
         approach_commands=approach_commands(start, p.selected.T_tcp_pre,
                                             p.selected.T_tcp_grasp, p.cfg['robot']))
     p.robot.arm.get_state.return_value = 0, 1  # pre-grasp is still moving
@@ -250,6 +279,31 @@ def test_disconnect_during_confirmation_blocks_accepted_approach(
         demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
                             auto=False, stream=p.stream)
     assert_only_pregrasp(p)
+
+
+@pytest.mark.parametrize('travel_acc,expected_pre_acc', [(1800., 1800.), (None, 1100.)])
+def test_confirm_mode_keeps_pregrasp_acceleration_out_of_final_approach(
+        setup_pick, monkeypatch, travel_acc, expected_pre_acc):
+    from efg.motion_command import PlanRejected
+
+    p = setup_pick
+    p.cfg['robot'].update(travel_speed_mm_s=1000., approach_speed_mm_s=250.,
+                          approach_acc_mm_s2=1100.)
+    if travel_acc is not None:
+        p.cfg['robot']['travel_acc_mm_s2'] = travel_acc
+    monkeypatch.setattr(demo, 'confirm', Mock(return_value=True))
+    # End after both approach commands, before any gripper close/transfer.
+    monkeypatch.setattr(demo, 'prepare_transfer', Mock(side_effect=PlanRejected('test end')))
+    assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                               auto=False, stream=p.stream) == ('abort', '상승 경로 준비')
+    assert p.move.call_count == 2
+    pre_call, grasp_call = p.move.call_args_list
+    assert pre_call.args[1] is p.selected.T_tcp_pre
+    assert grasp_call.args[1] is p.selected.T_tcp_grasp
+    assert [call.args[2] for call in p.move.call_args_list] == [1000., 250.]
+    assert [call.kwargs['acc_mm_s2'] for call in p.move.call_args_list] == [expected_pre_acc, 1100.]
+    p.robot.arm.set_tcp_maxacc.assert_not_called()
+    p.gripper.grip.assert_not_called()
 
 
 def test_auto_mode_disconnect_after_open_blocks_approach(setup_pick, monkeypatch):

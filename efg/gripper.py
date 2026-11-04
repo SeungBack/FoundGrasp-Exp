@@ -60,6 +60,9 @@ class GripperCtl:
         self.pre_open_min_wait_s = float(g.get("pre_open_min_wait_s", 0.1))
         if not 0.1 <= self.pre_open_min_wait_s <= 10.0:
             raise ValueError("gripper.pre_open_min_wait_s는 0.1~10초 범위여야 합니다")
+        self.pre_open_reconnect_timeout_s = float(g.get("pre_open_reconnect_timeout_s", 3.0))
+        if not 0 <= self.pre_open_reconnect_timeout_s <= 10.0:
+            raise ValueError("gripper.pre_open_reconnect_timeout_s는 0~10초 범위여야 합니다")
         self.stroke_mm = float(g["stroke_mm"])
         self.release_mode = g.get("release_mode", "width")
         self.release_margin_mm = float(g.get("release_margin_mm", 5.0))
@@ -289,16 +292,42 @@ class GripperCtl:
         time.sleep(0.2)
         return send_fn()
 
-    def _move_cmd(self, send_fn, target_pct, desc, check=None):
+    def _move_cmd(self, send_fn, target_pct, desc, check=None, diagnostics=None):
         """이동 명령 전송 + 실제 이동 시작 검증 (미시작 시 1회 재전송).
 
         이미 목표 근처면 이동이 없는 게 정상이므로 전송만 하고 성공 처리.
+        diagnostics는 통신 실패와 정상 ACK 후 무동작/모터 오류를 구분한다.
         """
+        def failed(communication=False):
+            if diagnostics is not None:
+                diagnostics['communication_failed'] = communication
+            return False
+
+        def unresponsive(acknowledged):
+            if check:
+                check()
+            status = self._read_status()
+            if check:
+                check()
+            print(f"경고: {desc} 명령이 동작하지 않음 — [{self._fmt_status(status)}]")
+            healthy = (status is not None and status.enabled
+                       and not status.fault and not status.initialized)
+            return failed(communication=status is None or (not acknowledged and healthy))
+
         if check:
             check()
         s0 = self._read_status()
-        if s0 is not None and self._reached(s0, target_pct):
-            return bool(send_fn())  # 홀드 목표 갱신도 ACK 실패를 무시하지 않음
+        if check:
+            check()
+        if s0 is None:
+            print(f"경고: {desc} 시작 상태 읽기 실패 (Modbus)")
+            return failed(communication=True)
+        if s0.fault or not s0.enabled or s0.initialized:
+            print(f"경고: {desc} 시작 상태 오류 — [{self._fmt_status(s0)}]")
+            return failed()
+        if self._reached(s0, target_pct):
+            return True if send_fn() else unresponsive(acknowledged=False)
+        acknowledged = False
         for attempt in (1, 2):
             if check:
                 check()
@@ -306,13 +335,12 @@ class GripperCtl:
                 print(f"   경고: {desc} 명령 전송 실패 (Modbus, {attempt}차)")
                 time.sleep(0.2)
                 continue
+            acknowledged = True
             if self._motion_started(s0, check=check):
                 return True
             print(f"   경고: {desc} 명령 후 이동 미감지 ({attempt}차) — 재전송")
             s0 = self._read_status()
-        print(f"경고: {desc} 명령이 동작하지 않음 — "
-              f"[{self._fmt_status(self._read_status())}]")
-        return False
+        return unresponsive(acknowledged)
 
     def _motion_started(self, s0, timeout=CMD_START_TIMEOUT_S, check=None):
         """기준 상태 s0 대비 위치가 변하기 시작했는지 감지."""
@@ -392,22 +420,81 @@ class GripperCtl:
     def pre_open(self, width_m, check=None):
         """목표 그립 폭 + 여유(mm)만큼만 개방 — 접근 중 주변 충돌 최소화.
 
-        시작·도달 검증 + 잼 보호 포함.
+        시작·도달 검증 + 잼 보호 포함. 통신 실패만 포트를 재연결하고 한 번 재시도한다.
         """
         open_mm = width_m * 1000.0 + self.pre_open_margin_mm
         pct = min(100.0, open_mm / self.stroke_mm * 100.0)
         detail(f"pre-open 목표: {pct:.0f}% (그립 폭 {width_m * 1000:.0f}mm + "
               f"여유 {self.pre_open_margin_mm:.0f}mm)")
-        if not self._move_cmd(lambda: self._set_raw_open_pct(pct), pct, "pre-open", check=check):
-            return False
-        ok, s = self._wait_settle(jam_protect=True,
-                                  min_wait_s=self.pre_open_min_wait_s, check=check)
-        if not (ok and self._reached(s, pct)):
+        def attempt():
+            diagnostics = {}
+            if not self._move_cmd(lambda: self._set_raw_open_pct(pct), pct, "pre-open",
+                                  check=check, diagnostics=diagnostics):
+                return False, diagnostics.get('communication_failed', False)
+            ok, s = self._wait_settle(jam_protect=True,
+                                      min_wait_s=self.pre_open_min_wait_s, check=check)
+            if (ok and self._reached(s, pct) and s.enabled
+                    and not s.fault and not s.initialized):
+                return True, False
             pos = None if s is None else round(self._pos_pct(s), 1)
-            print(f"경고: pre-open 실패 (목표 {pct:.0f}%, 실제 {pos}%) — "
-                  "그리퍼 상태 점검 필요")
+            print(f"경고: pre-open 실패 (목표 {pct:.0f}%, 실제 {pos}%) — 그리퍼 상태 점검 필요")
+            return False, s is None
+
+        ok, communication_failed = attempt()
+        if ok or not communication_failed or not self.pre_open_reconnect_timeout_s:
+            return ok
+        if not self._reconnect_pre_open(check=check):
             return False
-        return True
+        if check:
+            check()
+        return attempt()[0]
+
+    def _reconnect_pre_open(self, check=None):
+        """Reopen a stale USB serial handle, with no enable/init/motor command.
+
+        Only pre-open can use this recovery, before the final approach is queued.
+        A fresh healthy status is required; a reconnected device is not proof of
+        reaching the width. The caller must replay and verify that separately.
+        The deadline bounds retries, not the duration of a blocking vendor call.
+        """
+        deadline = time.monotonic() + self.pre_open_reconnect_timeout_s
+        row("그리퍼 통신", f"포트 재연결 시도 · 최대 {self.pre_open_reconnect_timeout_s:g}초")
+        while time.monotonic() < deadline:
+            if check:
+                check()
+            connected = False
+            try:
+                # connect() alone accepts pymodbus's stale non-None socket.
+                # Closing first lets the by-id path resolve the re-enumerated tty.
+                self.g.disconnect()
+                if check:
+                    check()
+                if time.monotonic() >= deadline:
+                    break
+                connected = self.g.connect(initialize=False)
+            except OSError as exc:
+                detail(f"그리퍼 포트 재연결 대기: {exc}")
+            if check:
+                check()
+            if time.monotonic() >= deadline:
+                break
+            if connected:
+                status = self._read_status()
+                if check:
+                    check()
+                if time.monotonic() >= deadline:
+                    break
+                if status is not None:
+                    pct = self._pos_pct(status)
+                    if (status.fault or not status.enabled or status.initialized
+                            or not math.isfinite(pct) or not 0 <= pct <= 100):
+                        print(f"경고: 재연결 후 그리퍼 상태 오류 — [{self._fmt_status(status)}]")
+                        return False
+                    row("그리퍼 통신", "재연결·상태 확인 완료 · 목표 폭 재확인")
+                    return True
+            time.sleep(min(.1, max(0., deadline - time.monotonic())))
+        print("경고: 그리퍼 통신 복구 시간 초과 — 최종 접근하지 않습니다")
+        return False
 
     def release(self, width_m, check=None):
         """Open fully, returning once the measured release clearance is reached.

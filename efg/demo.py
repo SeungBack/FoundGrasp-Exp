@@ -210,6 +210,9 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
         planned = {} if prepared_pick is None else dict(
             commands=prepared_pick.approach_commands,
             j7_limits=cfg["selection"].get("j7_limit_deg", [-89., 90.]))
+        if prepared_pick is not None and prepared_pick.speed_scale < 1:
+            pre_command, grasp_command = prepared_pick.approach_commands
+            console.row("접근 명령", f"pre-grasp {pre_command.speed:g} → grasp {grasp_command.speed:g} mm/s")
         if not approach_blended(robot, sel.T_tcp_pre, sel.T_tcp_grasp,
                                 r, check=check_approach,
                                 prepare=lambda: gripper.pre_open(sel.open_width_m, check=check_preopen),
@@ -234,7 +237,8 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
         phase("Pre-grasp / opening")
         opener = threading.Thread(target=_open, daemon=True)
         opener.start()
-        moved = move_tcp(robot, sel.T_tcp_pre, r["travel_speed_mm_s"])
+        moved = move_tcp(robot, sel.T_tcp_pre, r["travel_speed_mm_s"],
+                         acc_mm_s2=r.get("travel_acc_mm_s2", r.get("approach_acc_mm_s2", 500)))
         t_move = time.monotonic() - t0
         opener.join(timeout=GRIPPER_OPEN_TIMEOUT_S)
         console.detail(f"병행: 이동 {t_move:.2f}s / 개방 {res.get('t', float('nan')):.2f}s")
@@ -249,15 +253,10 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
             stream.raise_if_failed()
 
         phase("Approaching")
-        # 확인 모드에서도 설정한 접근 가속도를 적용한다.
-        acc = r.get("approach_acc_mm_s2")
-        if acc:
-            robot.arm.set_tcp_maxacc(float(acc))
-        try:
-            ok_move = move_tcp(robot, sel.T_tcp_grasp, r["approach_speed_mm_s"])
-        finally:
-            if acc:  # 이후 구간(복귀·상승)은 기본 가속도로 복원
-                robot.arm.set_tcp_maxacc(float(r.get("default_acc_mm_s2", 5000)))
+        # Each command owns its acceleration; pre-grasp's faster setting must
+        # not leak into the final approach through the SDK's parameter cache.
+        ok_move = move_tcp(robot, sel.T_tcp_grasp, r["approach_speed_mm_s"],
+                           acc_mm_s2=r.get("approach_acc_mm_s2", 500))
         if not ok_move:
             return "abort", "접근 이동"
 
@@ -284,6 +283,7 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
         plan = prepare_transfer(
             robot, sel.T_tcp_pre, sel.T_tcp_lift, r, d, transfer_sign=transfer_sign,
             j7_limits=cfg.get("selection", {}).get("j7_limit_deg", [-89., 90.]),
+            planning_j7_limits=candidate_j7_limits(cfg.get("selection", {})),
             camera_up=constraint, allow_symmetry=True, check=check_transfer, **preferred)
     except CameraError:
         raise
@@ -309,9 +309,9 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
     if plan.transfer_sign != transfer_sign:
         console.row("상승 계획", f"실측 자세에서 대칭 방향 변경 {transfer_sign:+d} → {plan.transfer_sign:+d}")
     if plan.speed_scale < 1:
-        console.row("상승 계획", f"속도 초과 사전 검사 대응 · 이번 검사 입력 명령 대비 속도 {plan.speed_scale:.0%}, "
-                    f"가속도 {plan.speed_scale ** 2:.0%} · "
-                    f"이송 명령 {plan.commands[-1].speed:g}°/s")
+        console.row("상승 계획", "속도 검사에 걸린 연결 구간만 감속 · " + " · ".join(
+            f"{command.label} {command.speed:g}{'°/s' if command.kind == 'joint' else 'mm/s'}"
+            for command in plan.commands))
     if getattr(plan, "route_name", "configured") != "configured":
         console.row("상승 경로", f"{plan.route_name} · 이송 시작 Z {plan.upper[2, 3] * 1000:.0f} mm")
     if timing is not None:
@@ -744,8 +744,8 @@ def _run(cfg, auto=True, dry_run=False):
             if predicted is not None:
                 lo, hi = cfg["selection"].get("j7_limit_deg", [-89., 90.])
                 reserve = min(predicted[0] - lo, hi - predicted[1])
-                console.row("손목 계획", f"예상 J7 {predicted[0]:.1f}~{predicted[1]:.1f}° · "
-                            f"한계까지 최소 {reserve:.1f}° 여유")
+                console.row("손목 예측", f"선정 IK: J7 {predicted[0]:.1f}~{predicted[1]:.1f}° · "
+                            f"예상 여유 {reserve:.1f}° · 파지점 실측 재검사")
             console.row("검출점", "  ".join(f"{axis} {value * 1000:.1f}" for axis, value in
                                        zip("XYZ", s.p_base)) + " mm")
             tcp_target = s.T_tcp_grasp[:3, 3]

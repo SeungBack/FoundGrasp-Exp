@@ -164,17 +164,37 @@ def test_only_known_native_results_are_candidate_path_rejections(code, result, e
     assert not MotionCheckError('unknown', code=code, result=result).is_path_rejection
 
 
-def test_shared_approach_compiler_bounds_corner_and_stops_at_grasp():
+@pytest.mark.parametrize('acceleration_config,expected_accelerations', [
+    ({}, [700., 700.]),
+    ({'travel_acc_mm_s2': 1800., 'approach_acc_mm_s2': 1100.}, [1800., 1100.]),
+])
+def test_shared_approach_compiler_bounds_corner_and_stops_at_grasp(
+        acceleration_config, expected_accelerations):
     import numpy as np
     from efg.motion_command import approach_commands
     start, pre, grasp = (np.eye(4) for _ in range(3))
     start[2, 3], pre[2, 3], grasp[2, 3] = .5, .2, .1
-    cfg = {'travel_speed_mm_s': 600, 'approach_speed_mm_s': 400,
+    cfg = {'travel_speed_mm_s': 600, 'approach_speed_mm_s': 250,
            'approach_acc_mm_s2': 700, 'pregrasp_blend_radius_mm': 50}
+    cfg.update(acceleration_config)
     commands = approach_commands(start, pre, grasp, cfg)
     assert commands[0].radius == pytest.approx(25.)
     assert commands[1].radius == -1
     assert [command.target[2] for command in commands] == [200., 100.]
-    assert [command.speed for command in commands] == [600., 400.]
-    assert [command.acceleration for command in commands] == [700., 700.]
+    assert [command.speed for command in commands] == [600., 250.]
+    assert [command.acceleration for command in commands] == expected_accelerations
     assert approach_commands(pre, pre, grasp, cfg)[0].radius == -1
+
+
+@pytest.mark.parametrize('acceleration', [0., -1., float('nan'), float('inf'), -float('inf')])
+def test_invalid_travel_acceleration_blocks_all_native_submissions(arm, acceleration):
+    import numpy as np
+    from efg.motion_command import approach_commands
+    start, pre, grasp = (np.eye(4) for _ in range(3))
+    start[2, 3], pre[2, 3], grasp[2, 3] = .5, .2, .1
+    cfg = {'travel_speed_mm_s': 600, 'approach_speed_mm_s': 250,
+           'travel_acc_mm_s2': acceleration, 'approach_acc_mm_s2': 1100}
+    with pytest.raises(ValueError):
+        preflight_commands(arm, approach_commands(start, pre, grasp, cfg))
+    arm.set_position.assert_not_called()
+    arm.set_servo_angle.assert_not_called()

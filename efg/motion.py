@@ -179,8 +179,8 @@ def _stopped_transfer_joints(robot, j7_limits, *, label="조인트 이송"):
 def _prepare_joint_transfer(robot, command, j7_limits, check=None, metrics=None):
     """Finalize the unsent joint phase at its measured stationary start.
 
-    The already checked command is the ceiling: bounded native overspeed
-    retiming may reduce it to 50% speed / 25% acceleration, never increase it.
+    The input carries the original configured ceilings for this unsent phase.
+    Bounded native overspeed retiming may reduce it to 50% speed / 25% acceleration.
     The target and exact-stop radius stay fixed; no joint motion is sent here.
     """
     started = time.perf_counter()
@@ -212,8 +212,8 @@ def _prepare_joint_transfer(robot, command, j7_limits, check=None, metrics=None)
                            joint_acc_deg_s2=accepted.acceleration)
         if scale < 1:
             row('이송 계획', f"{accepted.speed:g}°/s · {accepted.acceleration:g}°/s² · "
-                f"상승 후 정지 지점에서 감속 재검사 통과 (기존 명령 속도의 {scale:.0%})")
-        return accepted
+                f"상승 후 실측 자세에서 재검사 통과 (설정 속도의 {scale:.0%})")
+        return accepted, check_start
     finally:
         if metrics is not None:
             metrics['joint_preflight_s'] = time.perf_counter() - started
@@ -271,7 +271,7 @@ def lift_and_transfer_blended(robot, plan, robot_cfg, drop_cfg, check=None,
     Continuous plans queue retreat/rise/transfer together and stop only at the
     release goal. Stopped plans retain the upper arrival barrier, then finalize
     the unsent joint phase from the measured upper configuration. Only that
-    phase's speed/acceleration ceilings may decrease before its first command.
+    phase is checked afresh against its original ceilings before its first command.
     Neither mode replans or retries a phase after its physical motion starts.
     """
     if metrics is not None:
@@ -296,6 +296,7 @@ def lift_and_transfer_blended(robot, plan, robot_cfg, drop_cfg, check=None,
                    f"이송 {plan.commands[-1].speed:g}°/s · 릴리즈에서 정지")
         rise_started = time.perf_counter()
         for index, command in enumerate(plan.commands):
+            joint_guard = None
             if index == transfer_index and not plan.continuous:
                 upper_confirmed = wait_tcp_stopped(
                     robot, target, float(drop_cfg.get("transfer_timeout_s", 60)), check,
@@ -306,15 +307,18 @@ def lift_and_transfer_blended(robot, plan, robot_cfg, drop_cfg, check=None,
                 if on_stage:
                     on_stage("Preparing joint transfer")
                 # The Cartesian motion may finish in a different redundant-arm
-                # configuration than the earlier shadow plan. Check the exact
-                # joint phase from that measured stopped configuration, with
-                # bounded reductions of the existing limits if needed.
-                command = _prepare_joint_transfer(
-                    robot, command, plan.j7_limits, check=check, metrics=metrics)
-            if check:
-                check()
+                # configuration than the earlier shadow plan. Replan ONLY this
+                # unsent phase from the measured stop and original ceilings.
+                # Continuous plans never reset limits or replan in flight.
+                command, joint_guard = _prepare_joint_transfer(
+                    robot, plan.nominal_commands[-1], plan.j7_limits,
+                    check=check, metrics=metrics)
             if index == transfer_index and not plan.continuous and on_stage:
                 on_stage("Joint transfer")
+            if check:
+                check()
+            if joint_guard is not None:
+                joint_guard()
             code = command.submit(robot.arm, only_check_type=0)
             if code:
                 raise RuntimeError(f"{command.label} 명령 거부 (code={code})")
@@ -419,6 +423,7 @@ def recover_unclosed_pick(robot, pick_plan, robot_cfg, check=None,
         reverse_cfg = dict(robot_cfg,
                            travel_speed_mm_s=min(speed_cap, forward_grasp.speed),
                            approach_speed_mm_s=min(speed_cap, forward_pre.speed),
+                           travel_acc_mm_s2=acceleration,
                            approach_acc_mm_s2=acceleration,
                            pregrasp_blend_radius_mm=max(0., forward_pre.radius))
         commands = approach_commands(current, pick_plan.pre, pick_plan.start_tcp, reverse_cfg)

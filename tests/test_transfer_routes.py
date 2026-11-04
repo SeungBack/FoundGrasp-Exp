@@ -10,7 +10,7 @@ from scipy.spatial.transform import Rotation
 from efg.camera import CameraError
 from efg.motion_command import MotionCheckError, PlanRejected
 from efg.se3 import xarm_pose_to_se3
-from efg.transfer_plan import (TransferRoute, closest_upright_rotation,
+from efg.transfer_plan import (TransferPlan, TransferRoute, closest_upright_rotation,
                                prepare_transfer, route_path_error, transfer_commands,
                                transfer_route_candidates, transfer_waypoint)
 
@@ -188,7 +188,7 @@ def test_camera_loss_during_native_rejection_is_never_a_retryable_plan(scene):
 
 
 @pytest.mark.parametrize('dense', [False, True])
-def test_preferred_retimed_route_keeps_exact_commands_without_nominal_duplicate(scene, dense):
+def test_preferred_retimed_route_keeps_geometry_and_rechecks_original_caps(scene, dense):
     s = scene
     if dense:
         s.lift[2, 3] = .20
@@ -202,8 +202,79 @@ def test_preferred_retimed_route_keeps_exact_commands_without_nominal_duplicate(
     assert len(found) == (18 if dense else 3)
     assert sum(r.name == original.name for r in found) == 1
     plan = prepare(s, preferred_route=slowed)
-    assert plan.commands == slowed.commands
+    assert plan.route_name == original.name
+    assert plan.commands == original.commands
+    assert plan.nominal_commands == original.commands
+    assert plan.speed_scale == 1.
+    assert slowed.nominal_commands == original.commands
     assert_checks_only(s)
+
+
+def test_preferred_route_original_caps_survive_config_changes_at_new_grasp_check(scene):
+    s = scene
+    original = routes(s)[0]
+    slowed = replace(original, commands=tuple(
+        replace(c, speed=c.speed * .8, acceleration=c.acceleration * .64)
+        for c in original.commands))
+    s.cfg.update(retreat_speed_mm_s=900, reorient_speed_mm_s=900,
+                 lift_acc_mm_s2=1500, reorient_acc_mm_s2=1500)
+    s.drop.update(joint_speed_deg_s=180, joint_acc_deg_s2=450)
+
+    plan = prepare(s, preferred_route=slowed)
+
+    assert plan.commands == original.commands
+    assert plan.nominal_commands == original.commands == slowed.nominal_commands
+    for command, written in zip(original.commands, s.arm.writes):
+        assert written[2]['speed'] == command.speed
+        assert written[2]['mvacc'] == command.acceleration
+    assert slowed.commands[0].speed == pytest.approx(original.commands[0].speed * .8)
+    with pytest.raises(FrozenInstanceError):
+        plan.nominal_commands[0].speed = 999
+    assert_checks_only(s)
+
+
+def test_fresh_grasp_c24_retiming_does_not_compound_prior_scan_reduction(scene):
+    s = scene
+    original = routes(s)[0]
+    slowed = replace(original, commands=tuple(
+        replace(c, speed=c.speed * .8, acceleration=c.acceleration * .64)
+        for c in original.commands))
+    s.arm.responses = [(0, 0), (1, 24)]
+
+    plan = prepare(s, preferred_route=slowed)
+
+    assert plan.nominal_commands == original.commands
+    assert plan.speed_scale == .8
+    assert [written[2]['only_check_type'] for written in s.arm.writes] == [1, 3, 1, 3, 2]
+    assert s.arm.writes[0][2]['speed'] == original.commands[0].speed
+    for nominal, accepted in zip(original.commands[:-1], plan.commands[:-1]):
+        assert accepted.speed == pytest.approx(nominal.speed * .8)
+        assert accepted.acceleration == pytest.approx(nominal.acceleration * .64)
+    assert plan.commands[-1] == original.commands[-1]
+    assert_checks_only(s)
+
+
+@pytest.mark.parametrize('container', ['route', 'plan'])
+@pytest.mark.parametrize('change', ['target', 'kind', 'radius', 'label', 'speed', 'acceleration'])
+def test_nominal_caps_cannot_change_path_or_allow_accepted_limits_above_them(
+        scene, container, change):
+    route = routes(scene)[0]
+    original = (route if container == 'route' else TransferPlan(
+        scene.grasp, scene.joints, route.pre, route.upper, route.transfer_sign,
+        commands=route.commands))
+    last = original.commands[-1]
+    changes = {
+        'target': {'target': (1.,) * 7},
+        'kind': {'kind': 'cartesian', 'target': (0.,) * 6},
+        'radius': {'radius': last.radius + 1},
+        'label': {'label': 'different phase'},
+        'speed': {'speed': last.speed * .5},
+        'acceleration': {'acceleration': last.acceleration * .5},
+    }
+    nominal = (*original.commands[:-1], replace(last, **changes[change]))
+    with pytest.raises(ValueError, match='원본 경로와 같고 속도·가속도 상한 이하'):
+        replace(original, nominal_commands=nominal)
+    assert not scene.arm.writes
 
 
 def test_hard_j7_constraint_applies_to_route_interiors(scene):

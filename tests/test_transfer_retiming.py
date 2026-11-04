@@ -1,4 +1,5 @@
 """Bounded native overspeed recovery without moving or connecting a robot."""
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -17,6 +18,18 @@ def commands():
         MotionCommand('cartesian', (400, -200, 200, 0, 0, 0), 600, 700, 10, 'retreat'),
         MotionCommand('cartesian', (400, -200, 370, 0, 0, 0), 500, 600, 20, 'rise'),
         MotionCommand('joint', (10,) * 7, 120, 200, 0, 'place'),
+    )
+
+
+@pytest.fixture
+def pick_commands(commands):
+    """Approach, retreat/rise and place are three independently stopped phases."""
+    return (
+        MotionCommand('cartesian', (400, -200, 200, 0, 0, 0), 900, 1100, 10, 'pregrasp'),
+        MotionCommand('cartesian', (400, -200, 100, 0, 0, 0), 500, 1100, -1, 'grasp'),
+        commands[0],
+        replace(commands[1], radius=-1),
+        commands[2],
     )
 
 
@@ -41,7 +54,7 @@ def assert_checks_only(arm):
     arm.set_only_check_type.assert_not_called()
 
 
-def test_later_segment_overspeed_rechecks_entire_chain_with_uniform_limits(arm, commands):
+def test_blended_phase_overspeed_rechecks_entire_chain_with_uniform_limits(arm, commands):
     arm.responses = [(0, 0), (1, 24)]
     guard = Mock()
 
@@ -57,6 +70,70 @@ def test_later_segment_overspeed_rechecks_entire_chain_with_uniform_limits(arm, 
         assert (after.kind, after.target, after.radius, after.label) == (
             before.kind, before.target, before.radius, before.label)
     assert commands[0].speed == 600 and commands[0].acceleration == 700
+    assert_checks_only(arm)
+
+
+@pytest.mark.parametrize('stop_radius', [-1, 0])
+def test_rise_overspeed_does_not_slow_stopped_approach_or_joint_phases(
+        arm, pick_commands, stop_radius):
+    original = tuple(replace(command, radius=stop_radius) if index in (1, 3) else command
+                     for index, command in enumerate(pick_commands))
+    arm.responses = [(0, 0)] * 3 + [(1, 24)]
+
+    prepared, scale = preflight_with_retiming(arm, original, check_start=Mock())
+
+    assert scale == .8
+    assert [command.speed for command in prepared] == pytest.approx([900, 500, 480, 400, 120])
+    assert [command.acceleration for command in prepared] == pytest.approx(
+        [1100, 1100, 448, 384, 200])
+    assert [call[2]['only_check_type'] for call in arm.writes] == [1, 3, 3, 3, 1, 3, 3, 3, 2]
+    assert prepared[0] is original[0] and prepared[1] is original[1]
+    assert prepared[4] is original[4]
+    assert original[2].speed == 600 and original[3].speed == 500
+    assert_checks_only(arm)
+
+
+def test_separate_phase_failures_reduce_independently_from_original_limits(arm, pick_commands):
+    arm.responses = ([(0, 0)] * 3 + [(1, 24)]  # Rise needs 80%.
+                     + [(0, 0)] * 4 + [(1, 24)]  # Joint transfer needs 80%.
+                     + [(0, 0)] * 3 + [(1, 24)])  # Rise needs 60%.
+    guard = Mock()
+
+    prepared, scale = preflight_with_retiming(arm, pick_commands, check_start=guard)
+
+    assert scale == .6  # Summary minimum; the approach is still at nominal speed.
+    assert [command.speed for command in prepared] == pytest.approx([900, 500, 360, 300, 96])
+    assert [command.acceleration for command in prepared] == pytest.approx(
+        [1100, 1100, 252, 216, 128])
+    assert [arm.writes[index][2]['only_check_type'] for index in (0, 4, 9, 13)] == [1] * 4
+    assert [arm.writes[index][2]['speed'] for index in (0, 4, 9, 13)] == [900] * 4
+    assert guard.call_count == 5
+    assert_checks_only(arm)
+
+
+def test_retry_budget_allows_three_reductions_per_stopped_phase(arm, pick_commands):
+    # Give pregrasp and retreat distinct targets for the controller stub below.
+    original = (replace(pick_commands[0], target=(400, -200, 210, 0, 0, 0)),
+                *pick_commands[1:])
+    thresholds = {command.target: command.speed * .5 for command in original}
+
+    def submit(kind, target, **kwargs):
+        arm.writes.append((kind, target, kwargs))
+        arm.only_check_result = 24 if kwargs['speed'] > thresholds[tuple(target)] else 0
+        return 1 if arm.only_check_result else 0
+
+    arm.set_position.side_effect = lambda *target, **kw: submit('cartesian', target, **kw)
+    arm.set_servo_angle.side_effect = lambda *, angle, **kw: submit('joint', angle, **kw)
+    guard = Mock()
+
+    prepared, scale = preflight_with_retiming(arm, original, check_start=guard)
+
+    assert scale == .5
+    assert sum(call[2]['only_check_type'] == 1 for call in arm.writes) == 10
+    assert guard.call_count == 11
+    for before, after in zip(original, prepared):
+        assert after.speed == pytest.approx(before.speed * .5)
+        assert after.acceleration == pytest.approx(before.acceleration * .25)
     assert_checks_only(arm)
 
 
@@ -100,6 +177,17 @@ def test_a_new_non_speed_failure_ends_retiming_immediately(arm, commands):
     assert caught.value.command_index == 1 and caught.value.result == 21
     assert caught.value.speed_scale == .8
     assert len(arm.writes) == 3
+    assert_checks_only(arm)
+
+
+def test_error_reports_rejected_phase_scale_not_an_unrelated_reduction(arm, pick_commands):
+    arm.responses = ([(0, 0)] * 3 + [(1, 24)]
+                     + [(0, 0)] * 4 + [(1, 21)])
+    with pytest.raises(MotionCheckError) as caught:
+        preflight_with_retiming(arm, pick_commands, check_start=Mock())
+    assert caught.value.command_index == 4 and caught.value.result == 21
+    assert caught.value.speed_scale == 1.  # Only retreat/rise had been reduced.
+    assert len(arm.writes) == 9
     assert_checks_only(arm)
 
 

@@ -28,7 +28,8 @@ def gripper_parts(tcp_z, tip_length_m=.080):
 
     tip_length_m is the whole replaceable finger, from its root to TCP z=0,
     including the distal contact pad. It is not added to the metal finger.
-    The remaining flange-to-root length belongs to the housing/carriage model.
+    Mounting carriages are omitted from the visualization; finger roots and
+    the flange-to-TCP transform keep their measured positions.
     """
     tcp_z, tip_length_m = float(tcp_z), float(tip_length_m)
     if (not np.isfinite([tcp_z, tip_length_m]).all() or tip_length_m <= 0
@@ -47,8 +48,7 @@ def gripper_parts(tcp_z, tip_length_m=.080):
     finger_end = -(pad - overlap)
     finger_length = tip_length_m + finger_end
     for side, sign in [('left', 1), ('right', -1)]:
-        parts += [(f'{side}/carriage', bevel_box([.040, .024, .018], [0, sign*.012, -tip_length_m - .007], .003), metal),
-                  (f'{side}/finger', bevel_box([.024, .014, finger_length],
+        parts += [(f'{side}/finger', bevel_box([.024, .014, finger_length],
                                              [0, sign*.011, (-tip_length_m + finger_end)/2], .0025), metal),
                   (f'{side}/tip', bevel_box([.027, .010, pad], [0, sign*.005, -pad/2], .003), rubber)]
         for i in range(4):

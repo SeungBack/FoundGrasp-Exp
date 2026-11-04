@@ -73,11 +73,11 @@ def _joint_route_cost(*waypoints):
 
 
 def candidate_j7_limits(selection_cfg):
-    """Reserve wrist travel during selection; execution keeps the hard limits.
+    """Reserve wrist travel during selection and actual-grasp transfer planning.
 
     Unseeded controller IK may return a different branch after approaching.
     This reserve rejects boundary-adjacent candidates, not a certified bound
-    on that discrepancy. Actual-state planning and live monitoring still apply.
+    on that discrepancy. Live execution keeps the separate hard limits.
     """
     limits = np.asarray(selection_cfg.get("j7_limit_deg", [-89., 90.]), dtype=float)
     margin = float(selection_cfg.get("j7_selection_margin_deg", 0.))

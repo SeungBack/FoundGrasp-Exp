@@ -1,4 +1,5 @@
 """Checked open-gripper reverse approach; no hardware is connected."""
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -89,6 +90,27 @@ def test_recovery_retains_native_retiming_limits(scene):
     assert [kw['only_check_type'] for _, kw in s.writes] == [1, 1, 2, 0, 0]
     assert physical(s)[0][1]['speed'] == 320.
     assert physical(s)[0][1]['mvacc'] == pytest.approx(224.)
+
+
+@pytest.mark.parametrize('approach_acc,lift_acc,forward_acc,expected_acc', [
+    (1100., 350., (1800., 1100.), 350.),
+    (700., 1400., (1800., 1100.), 700.),
+    (1100., 1400., (450., 650.), 450.),
+    (1100., 1400., (900., 650.), 650.),
+])
+def test_fast_travel_acceleration_cannot_bypass_recovery_caps(
+        scene, approach_acc, lift_acc, forward_acc, expected_acc):
+    s = scene
+    s.cfg.update(travel_acc_mm_s2=1800., approach_acc_mm_s2=approach_acc,
+                 lift_acc_mm_s2=lift_acc)
+    s.plan.approach_commands = tuple(
+        replace(command, acceleration=acceleration)
+        for command, acceleration in zip(s.plan.approach_commands, forward_acc))
+    assert execute(s)
+    assert [kw['only_check_type'] for _, kw in s.writes] == [1, 2, 0, 0]
+    assert [kw['mvacc'] for _, kw in s.writes] == [expected_acc] * 4
+    assert s.cfg['travel_acc_mm_s2'] == 1800.
+    assert s.cfg['approach_acc_mm_s2'] == approach_acc
 
 
 @pytest.mark.parametrize('result', [21, 22, 23, 24])

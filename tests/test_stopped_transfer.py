@@ -139,7 +139,9 @@ def test_multi_waypoint_route_checks_joint_phase_after_all_cartesian_steps(scene
     middle = (plan.pre + plan.upper) / 2
     intermediate = replace(plan.commands[0], target=tuple(se3_to_xarm_pose(middle)),
                            radius=5., label='상승 중간 경유점')
-    plan = replace(plan, commands=(plan.commands[0], intermediate, *plan.commands[1:]))
+    plan = replace(plan, commands=(plan.commands[0], intermediate, *plan.commands[1:]),
+                   nominal_commands=(plan.nominal_commands[0], intermediate,
+                                     *plan.nominal_commands[1:]))
     s.writes.clear()
     s.robot.get_joints_deg.side_effect = lambda: (
         s.upper_joints.copy() if len(actual(s)) >= 3 else np.zeros(7))
@@ -305,6 +307,87 @@ def test_upper_retiming_budget_has_no_physical_retry_or_stale_c24_diagnostic(sce
     assert stages == ['Preparing joint transfer']
     assert metrics['failure_stage'] == '조인트 이송 사전 검사'
     s.robot.arm.get_c24_error_info.assert_not_called()
+    s.robot.arm.clean_error.assert_not_called()
+
+
+@pytest.mark.parametrize('upper_overspeed', [False, True])
+def test_upper_rechecks_original_joint_limits_without_compounding_preview_reduction(
+        scene, upper_overspeed):
+    s = scene
+    # Only the preview's joint phase fails. Its accepted 96 deg/s must not
+    # become the ceiling for the later check at the actual stopped upper pose.
+    s.responses = [(0, 0), (0, 0), (1, 24)]
+    plan = prepare(s)
+    assert plan.commands[-1].speed == pytest.approx(96.)
+    assert plan.nominal_commands[-1].speed == 120.
+    accepted_cartesian = plan.commands[:-1]
+    s.writes.clear()
+    s.responses = [(1, 24)] if upper_overspeed else []
+    s.drop['joint_speed_deg_s'] = 999.  # Immutable original snapshot is authoritative.
+    s.drop['joint_acc_deg_s2'] = 9999.
+    metrics = {}
+    assert execute(s, plan, metrics=metrics)
+    joint_checks = [kw for kind, _, kw in s.writes if kind == 'joint' and kw['only_check_type']]
+    assert [kw['speed'] for kw in joint_checks] == ([120., 96.] if upper_overspeed else [120.])
+    assert metrics['joint_speed_deg_s'] == (96. if upper_overspeed else 120.)
+    assert metrics['joint_acc_deg_s2'] == pytest.approx(128. if upper_overspeed else 200.)
+    for call, command in zip(actual(s)[:-1], accepted_cartesian):
+        assert call[2]['speed'] == command.speed
+        assert call[2]['mvacc'] == command.acceleration
+    assert actual(s)[-1][2]['speed'] == joint_checks[-1]['speed']
+    assert actual(s)[-1][2]['mvacc'] == joint_checks[-1]['mvacc']
+    assert plan.commands[-1].speed == pytest.approx(96.)
+
+
+def test_continuous_transfer_executes_accepted_limits_without_resetting_nominal(scene):
+    s = scene
+    s.drop['transfer_blend_radius_mm'] = 10.
+    s.responses = [(1, 24)]
+    plan = prepare(s)
+    assert plan.continuous
+    assert plan.commands[-1].speed < plan.nominal_commands[-1].speed
+    s.writes.clear()
+    assert execute(s, plan)
+    assert len(s.writes) == len(plan.commands)
+    for call, command in zip(s.writes, plan.commands):
+        assert call[2]['only_check_type'] == 0
+        assert call[2]['speed'] == command.speed
+        assert call[2]['mvacc'] == command.acceleration
+
+
+@pytest.mark.parametrize('change', ['state', 'fault', 'queue', 'drift', 'camera'])
+def test_post_check_stage_callback_cannot_invalidate_joint_start_before_submit(scene, change):
+    s = scene
+    plan = prepare(s)
+    s.writes.clear()
+    invalidated = [False]
+
+    def stage(name):
+        if name != 'Joint transfer':
+            return
+        invalidated[0] = True
+        if change == 'state':
+            s.robot.arm.get_state.return_value = 0, 4
+        elif change == 'fault':
+            s.robot.arm.get_err_warn_code.return_value = 0, [31, 0]
+        elif change == 'queue':
+            s.robot.arm.get_cmdnum.return_value = 0, 1
+        elif change == 'drift':
+            s.upper_joints[0] += 1.
+
+    def check():
+        if invalidated[0] and change == 'camera':
+            raise CameraError('camera failed after accepted joint check')
+
+    if change == 'camera':
+        with pytest.raises(CameraError):
+            execute(s, plan, on_stage=stage, check=check)
+    else:
+        assert not execute(s, plan, on_stage=stage, check=check)
+    assert invalidated[0]
+    assert [kind for kind, _, _ in actual(s)] == ['cartesian', 'cartesian']
+    assert sum(kind == 'joint' for kind, _, _ in s.writes) == 1  # Native check only.
+    s.robot.stop_motion.assert_called_once()
     s.robot.arm.clean_error.assert_not_called()
 
 
