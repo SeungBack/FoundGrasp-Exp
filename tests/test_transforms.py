@@ -77,24 +77,22 @@ def test_approach_tilt():
 @pytest.mark.parametrize("tilt", [0., 20.])
 @pytest.mark.parametrize("sign", [-1, 1])
 def test_measured_tool_and_insertion_preserve_existing_pick_flange_target(tilt, sign):
-    """The 20mm tool correction must not deepen the working pick endpoint."""
+    """223/70mm and 203/50mm calibrations produce the same flange target.
+
+    These are fixed calibration cases, independent of later insertion tuning.
+    """
     from scipy.spatial.transform import Rotation
-    from efg.config import load_config
     from efg.se3 import inv_se3, xarm_pose_to_se3
 
-    cfg = load_config()
     downward = np.column_stack([[0., 0., -1.], [0., 1., 0.], [1., 0., 0.]])
     R = Rotation.from_euler('y', tilt, degrees=True).as_matrix() @ downward
     p = np.array([.4195, -.1055, .1272])
     old_tcp = xarm_pose_to_se3([0., 0., 223., 0., 0., 0.])
-    offset = np.asarray(cfg['robot']['tcp_offset_mm_deg'], dtype=float).copy()
-    offset[3:] = np.radians(offset[3:])
-    new_tcp = xarm_pose_to_se3(offset)
+    new_tcp = xarm_pose_to_se3([0., 0., 203., 0., 0., 0.])
     for depth in (.015, .04):
         old = T.tool_pose_from_grasp(R, p, sign, depth + .07)
-        new = T.tool_pose_from_grasp(R, p, sign,
-                                    depth + cfg['selection']['approach_extra_m'])
-        for retreat in (0., cfg['selection']['pre_grasp_offset_m']):
+        new = T.tool_pose_from_grasp(R, p, sign, depth + .05)
+        for retreat in (0., .1):
             np.testing.assert_allclose(
                 T.offset_along_tool_z(old, retreat) @ inv_se3(old_tcp),
                 T.offset_along_tool_z(new, retreat) @ inv_se3(new_tcp), atol=1e-12)

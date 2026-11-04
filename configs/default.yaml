@@ -81,19 +81,19 @@ robot:
   # scripts/align_scan_pose.py(자동) 또는 teach_scan_pose.py(수동)로 갱신
   home_joints_deg: [-11.18, -22.16, -17.76, 77.08, -6.72, 98.24, -28.69]
   home_joint_speed_deg_s: 180 # 홈 복귀 조인트 속도 (deg/s), SDK 1.18.4 명령 상한
-  home_joint_acc_deg_s2: 330  # 홈 복귀 가속도 (deg/s²)
-  travel_speed_mm_s: 660     # 홈 -> pre-grasp 이동 속도 (mm/s)
-  lift_speed_mm_s: 660       # 복귀·자세 전환 공통 속도 상한 (mm/s)
-  retreat_speed_mm_s: 600    # 파지 후 pre-grasp 복귀 속도 상한
-  reorient_speed_mm_s: 660   # pre-grasp 이후 상승 속도 상한 (grasp 모드는 파지 방향 유지)
+  home_joint_acc_deg_s2: 450  # 홈 복귀 가속도 (deg/s²)
+  travel_speed_mm_s: 900     # 홈 -> pre-grasp 이동 속도 (mm/s)
+  lift_speed_mm_s: 900       # 복귀·자세 전환 공통 속도 상한 (mm/s)
+  retreat_speed_mm_s: 750    # 파지 후 pre-grasp 복귀 속도 상한
+  reorient_speed_mm_s: 900   # pre-grasp 이후 상승 속도 상한 (grasp 모드는 파지 방향 유지)
   reorient_angular_speed_deg_s: 300 # 회전량/이동거리 기반 속도 산정 기준 (관절 속도 보장은 아님)
-  reorient_acc_mm_s2: 770    # 자세 전환 구간 가속도
+  reorient_acc_mm_s2: 1200   # 자세 전환 구간 가속도
   rise_ik_step_mm: 20       # 상승 중간 자세 IK 검사 간격 (경로/특이점 통과 보장은 아님)
   rise_ik_step_deg: 5       # 병진·회전 중 더 촘촘한 간격 사용; 선정 시와 상승 전 재검사
-  lift_acc_mm_s2: 350        # 파지 후 pre-grasp 복귀 가속도: 걸림 상태에서 출발 충격 완화
-  approach_speed_mm_s: 400   # pre-grasp -> grasp 접근 속도 (mm/s)
-  approach_acc_mm_s2: 700    # 연속 pre-grasp/접근 명령의 가속도
-  pregrasp_blend_radius_mm: 10 # pre-grasp 통과 반경; 양쪽 구간 길이의 1/4 이하로 제한
+  lift_acc_mm_s2: 600        # 파지 후 pre-grasp 복귀 가속도; 자유 공간 상승보다 낮게 유지
+  approach_speed_mm_s: 500   # pre-grasp -> grasp 접근 속도 (mm/s)
+  approach_acc_mm_s2: 1100   # 연속 pre-grasp/접근 명령의 가속도
+  pregrasp_blend_radius_mm: 20 # pre-grasp 통과 반경; 양쪽 구간 길이의 1/4 이하로 제한
   retreat_blend_radius_mm: 50 # 복귀 -> 상승 경유점 통과 반경; 길이의 1/4 이하로 제한
   approach_confirm_s: 0.05   # 파지점 도착·정지·빈 큐 연속 확인 시간 (0.04~1초)
   approach_timeout_s: 60     # 연속 접근 완료 대기 한도
@@ -124,12 +124,12 @@ gripper:
   close_probe_on_connect: true  # 시작 시 홈 복귀 완료 후 close 방향 실측 점검, 통과해야 파지 사이클 시작
   force_pct: 80               # 그립 힘 (50~100)
   speed_pct: 100             # 그리퍼 API 속도 설정 상한 (100%)
-  close_min_wait_s: 0.2      # 닫힘 시작 확인 후 최소 대기; 연속 3회 위치 안정도 필요
+  close_min_wait_s: 0.15     # 닫힘 시작 확인 후 최소 대기; 연속 3회 위치 안정도 필요
   open_min_wait_s: 0.2       # full 모드/연결 점검의 완전 개방 최소 대기; 도달·정지 확인 유지
-  pre_open_min_wait_s: 0.2   # pre-grasp 폭 조절 최소 대기 (기존 1초); 도달·정지 확인 유지
+  pre_open_min_wait_s: 0.15  # pre-grasp 폭 조절 최소 대기; 도달·정지 확인 유지
   release_mode: width        # width: 놓을 폭까지만 확인 후 복귀 / full: 완전 개방·정착 대기
   release_margin_mm: 5       # max(선정 개방 폭, 현재 파지 폭) + 여유 (전체 stroke 이하)
-  release_confirm_s: 0.2    # 기준 폭 이상을 유지하는 시간; 시간만으로 놓았다고 판정하지 않음
+  release_confirm_s: 0.1    # 기준 폭 이상을 유지하는 시간; 시간만으로 놓았다고 판정하지 않음
   release_timeout_s: 5.0     # 최초 개방 명령부터 폭 확인까지 전체 한도 (재전송 포함)
   release_full_open_tolerance_mm: 1.5 # 100mm 끝단 판독 오차 허용; 일반 릴리즈 폭은 기존 엄격한 기준
   stroke_mm: 100.0            # 전체 스트로크. 팁 교체 시 실측 갱신
@@ -148,7 +148,7 @@ selection:
   approach_max_tilt_deg: 25     # 접근 방향과 수직(base -z)의 최대 각도. 29°에서 self-collision 실측
   pre_grasp_offset_m: 0.10      # 접근 방향 반대로 물러난 pre-grasp 거리
   use_grasp_depth: true         # 검출기가 예측한 그립별 depth 반영
-  approach_extra_m: 0.047      # 추가 삽입 5cm (+ 예측 depth). 팁 길이는 robot.tcp_offset_mm_deg로 보정
+  approach_extra_m: 0.047      # 추가 삽입 47mm (+ 예측 depth). 팁 길이는 robot.tcp_offset_mm_deg로 보정
   lift_height_m: 0.1           # 높은 이송 경유점의 최소 높이 = grasp z + 이 값
   ik_check_per_candidate: true
   j7_limit_deg: [-89, 90]       # 파지·상승 대칭 후보 모두에 적용하는 J7 허용 범위 (케이블 꼬임 방지)
@@ -167,14 +167,15 @@ drop:
   lift_orientation: grasp   # 각 높이에서 먼저 검사할 자세; grasp는 파지 자세 유지
                             # upright/home: 상승 중 수직/홈 자세로 회전하는 기존 모드
   route_search: true         # 높이·자세 대안을 낮은 경로부터 검사, 통과한 경로 실행
+  height_search_step_m: 0.02 # 높이 탐색 최대 간격 20mm: 통상 목표 Z 260/280/300/320/340/360mm
   min_transfer_height_m: 0.25 # 이송 하한(base TCP z): 빈 10cm·적재물 고려한 사용자 지정 25cm
                               # null이면 via_height만 사용. 실제 목표에는 아래 높이 여유를 더함
-  joint_speed_deg_s: 135      # 상승 정지 후 조인트 이송 상한 (사전 검사에서 필요 시 감속)
-  joint_acc_deg_s2: 220       # 이송 가속도 (deg/s²)
+  joint_speed_deg_s: 180      # 상승 정지 후 조인트 이송 상한 (사전 검사에서 필요 시 감속)
+  joint_acc_deg_s2: 350       # 이송 가속도 (deg/s²)
   transfer_blend_radius_mm: 0 # 선형 상승→조인트 이송 혼합 연결에서 C24 재발: 상승 정지 확인 후 이송
   transfer_clearance_margin_mm: 10 # 높은 경유점 여유; 블렌딩 반경보다 작으면 반경만큼 확보
   transfer_timeout_s: 60     # 상승/이송 완료 대기 한도
-  transfer_confirm_s: 0.10   # transfer_blend_radius_mm=0일 때 상승 도착·정지 확인 (0.04~1초)
+  transfer_confirm_s: 0.05   # transfer_blend_radius_mm=0일 때 상승 도착·정지 확인 (0.04~1초)
   arrival_confirm_s: 0.05    # 릴리즈 관절 목표 도착·정지·빈 큐 확인 시간 (0.04~1초)
   via_height_m: 0.35          # 기존 기준 높이(base z, m). 경로 탐색은 min_transfer_height부터 낮은 순
                               # 각 후보는 max(grasp+lift_height, 후보 높이, pre-grasp+5cm)

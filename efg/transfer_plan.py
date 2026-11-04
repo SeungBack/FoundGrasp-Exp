@@ -302,11 +302,11 @@ def transfer_commands(current, pre, upper, upper_radius, robot_cfg, drop_cfg):
 
 def transfer_route_candidates(current, T_pre, T_lift, robot_cfg, drop_cfg, R_home_tcp, *,
                               transfer_sign=1, allow_symmetry=False, preferred_route=None):
-    """Search at most nine Cartesian routes within explicit clearance bounds.
+    """Search height and orientation alternatives within explicit clearance bounds.
 
     Without a minimum-height setting, retain the configured upper height. With
-    an explicit minimum, search the lowest permitted height, then its midpoint
-    to the nominal height, then nominal. The original object-escape lift and
+    an explicit minimum, sample upward at height_search_step_m intervals and
+    include the exact nominal endpoint. The original object-escape lift and
     pre-grasp + 50mm remain hard lower bounds. At each height try the configured
     orientation, half tilt correction, then nearest upright. Legacy dual-sign
     search uses the two configured signs and nearest upright instead, retaining
@@ -337,15 +337,25 @@ def transfer_route_candidates(current, T_pre, T_lift, robot_cfg, drop_cfg, R_hom
         append(replace(preferred_route, start=current))
     search = bool(drop_cfg.get('route_search', False))
     minimum = _minimum_transfer_height(drop_cfg)
+    step = float(drop_cfg.get('height_search_step_m', .02))
+    if not np.isfinite(step) or step <= 0:
+        raise ValueError('drop.height_search_step_m는 유한한 양수여야 합니다')
     nominal_height = max(float(T_lift[2, 3]), float(T_pre[2, 3]) + .05,
                          float(drop_cfg.get('via_height_m', .35)), minimum or 0.)
     heights = [('nominal', nominal_height)]
     if search and minimum is not None:
         lower_height = max(minimum, float(T_lift[2, 3]), float(T_pre[2, 3]) + .05)
         if lower_height < nominal_height - 1e-6:
-            heights = [('lower', lower_height),
-                       ('middle', (lower_height + nominal_height) / 2),
-                       ('nominal', nominal_height)]
+            # Do not silently truncate a dense search: the nominal endpoint may
+            # be the only feasible route. Reject unreasonable settings instead.
+            interval_count = (nominal_height - lower_height) / step
+            if not np.isfinite(interval_count) or interval_count > 63 + 1e-10:
+                raise ValueError('상승 높이 후보가 64개를 초과합니다 — '
+                                 'drop.height_search_step_m를 늘리거나 높이 범위를 줄이세요')
+            intervals = max(1, int(np.ceil(interval_count - 1e-10)))
+            heights = [('lower' if index == 0 else f'level_{index}',
+                        lower_height + index * step) for index in range(intervals)]
+            heights.append(('nominal', nominal_height))
     upright = (closest_upright_rotation(T_pre[:3, :3], R_home_tcp)
                if search else T_pre[:3, :3])
     has_tilt = not np.allclose(upright, T_pre[:3, :3], atol=1e-8, rtol=0)
@@ -386,7 +396,7 @@ def transfer_route_candidates(current, T_pre, T_lift, robot_cfg, drop_cfg, R_hom
             append(TransferRoute(prefix + name, T_pre, target, 1,
                                  (retreat, guard_command, replace(rise, speed=rise_speed), transfer),
                                  current))
-    return routes[:9]
+    return routes
 
 
 def _minimum_transfer_height(drop_cfg):

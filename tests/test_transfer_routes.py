@@ -187,16 +187,20 @@ def test_camera_loss_during_native_rejection_is_never_a_retryable_plan(scene):
     assert_checks_only(s)
 
 
-def test_preferred_retimed_route_keeps_exact_commands_without_nominal_duplicate(scene):
+@pytest.mark.parametrize('dense', [False, True])
+def test_preferred_retimed_route_keeps_exact_commands_without_nominal_duplicate(scene, dense):
     s = scene
+    if dense:
+        s.lift[2, 3] = .20
+        s.drop['min_transfer_height_m'] = .25
     original = routes(s)[1]
     slowed = replace(original, commands=tuple(
         replace(c, speed=c.speed * .6, acceleration=c.acceleration * .36)
         for c in original.commands))
     found = routes(s, preferred_route=slowed)
     assert found[0].commands == slowed.commands
-    assert len(found) == 3
-    assert sum(r.name == 'half_tilt' for r in found) == 1
+    assert len(found) == (18 if dense else 3)
+    assert sum(r.name == original.name for r in found) == 1
     plan = prepare(s, preferred_route=slowed)
     assert plan.commands == slowed.commands
     assert_checks_only(s)
@@ -266,11 +270,12 @@ def test_explicit_minimum_prioritizes_low_routes_with_clearance_margin(scene):
     s.lift[2, 3] = .20
     s.drop['min_transfer_height_m'] = .25
     found = routes(s)
-    assert [r.name for r in found] == [
-        'lower_configured', 'lower_half_tilt', 'lower_upright',
-        'middle_configured', 'middle_half_tilt', 'middle_upright',
-        'configured', 'half_tilt', 'upright']
-    assert [r.upper[2, 3] for r in found] == pytest.approx([.26] * 3 + [.31] * 3 + [.36] * 3)
+    assert len(found) == 18
+    assert [r.name for r in found[:3]] == [
+        'lower_configured', 'lower_half_tilt', 'lower_upright']
+    assert [r.name for r in found[-3:]] == ['configured', 'half_tilt', 'upright']
+    assert [r.upper[2, 3] for r in found] == pytest.approx(
+        np.repeat([.26, .28, .30, .32, .34, .36], 3))
     plan = prepare(s)
     assert plan.route_name == 'lower_configured'
     assert plan.upper[2, 3] == pytest.approx(.26)
@@ -292,6 +297,42 @@ def test_minimum_height_never_reduces_required_object_escape_height(scene, bound
     found = routes(s)
     assert found[0].upper[2, 3] == pytest.approx(clearance + .01)
     assert all(r.upper[2, 3] >= clearance + .01 - 1e-10 for r in found)
+
+
+@pytest.mark.parametrize('step,expected', [
+    (.01, np.linspace(.26, .36, 11)),
+    (.027, [.26, .287, .314, .341, .36]),
+    (1e20, [.26, .36]),
+])
+def test_height_spacing_is_configurable_and_both_endpoints_are_retained(scene, step, expected):
+    s = scene
+    s.lift[2, 3] = .20
+    s.drop.update(min_transfer_height_m=.25, height_search_step_m=step)
+    found = routes(s)
+    actual = [r.upper[2, 3] for r in found[::3]]
+    assert actual == pytest.approx(expected)
+    assert np.all(np.diff(actual) > 0)
+    assert np.max(np.diff(actual)) <= step + 1e-10
+    assert found[-1].name == 'upright'
+
+
+@pytest.mark.parametrize('step', [0, -.01, float('nan'), float('inf')])
+def test_invalid_height_spacing_fails_before_native_commands(scene, step):
+    s = scene
+    s.drop['height_search_step_m'] = step
+    with pytest.raises(ValueError, match='height_search_step_m'):
+        prepare(s)
+    assert not s.arm.writes
+
+
+@pytest.mark.parametrize('step', [1e-5, 1e-320])
+def test_excessive_height_search_is_rejected_instead_of_silently_truncated(scene, step):
+    s = scene
+    s.lift[2, 3] = .20
+    s.drop.update(min_transfer_height_m=.25, height_search_step_m=step)
+    with pytest.raises(ValueError, match='64개를 초과'):
+        prepare(s)
+    assert not s.arm.writes
 
 
 def test_null_minimum_never_invents_a_lower_clearance(scene):
@@ -318,27 +359,27 @@ def test_invalid_minimum_height_fails_before_any_native_command(scene, value):
     assert not s.arm.writes
 
 
-def test_rejected_low_routes_progress_to_middle_without_mutating_grasp(scene):
+def test_rejected_low_routes_progress_to_next_height_without_mutating_grasp(scene):
     s = scene
     s.lift[2, 3] = .20
     s.drop['min_transfer_height_m'] = .25
     s.arm.responses = [(0, 0), (1, 21)] * 3
     plan = prepare(s)
-    assert plan.route_name == 'middle_configured'
-    assert plan.upper[2, 3] == pytest.approx(.31)
+    assert plan.route_name == 'level_1_configured'
+    assert plan.upper[2, 3] == pytest.approx(.28)
     np.testing.assert_allclose(plan.pre, s.pre)
     np.testing.assert_allclose(plan.start_tcp, s.grasp)
     assert_checks_only(s)
 
 
-def test_dual_sign_search_keeps_nominal_upright_within_nine_route_budget(scene):
+def test_dual_sign_dense_search_keeps_nominal_upright_after_all_lower_routes(scene):
     s = scene
     s.lift[2, 3] = .20
     s.drop.update(min_transfer_height_m=.25, lift_orientation='home')
     s.robot.R_home_tcp = Rotation.from_euler('z', 90, degrees=True).as_matrix() @ s.robot.R_home_tcp
     upright = closest_upright_rotation(s.pre[:3, :3], s.robot.R_home_tcp)
     found = routes(s, allow_symmetry=True)
-    assert len(found) == 9
+    assert len(found) == 18
     assert found[-1].name == 'upright'
 
     def ik(target):
