@@ -7,6 +7,8 @@ import pytest
 
 from efg import motion
 from efg.camera import CameraError
+from efg import transfer_plan
+from scipy.spatial.transform import Rotation
 
 
 @pytest.fixture
@@ -137,19 +139,21 @@ def transfer(setup):
     p.robot.T_flange_tcp = np.eye(4)
     p.robot.check_flange_ik.return_value = True
     p.robot.flange_ik_joints_deg.return_value = [0.] * 7
+    p.robot.get_joints_deg.return_value = [0.] * 7
     p.robot.arm.set_servo_angle.return_value = 0
     p.robot.arm.get_servo_angle.return_value = 0, [1.] * 7
     start = np.eye(4)
     start[2, 3] = .4
-    target, _ = motion.transfer_waypoint(p.pre, p.lift, p.drop, p.robot.R_home_tcp)
+    target, _ = transfer_plan.transfer_waypoint(p.pre, p.lift, p.drop, p.robot.R_home_tcp)
     p.robot.get_tcp_pose.side_effect = lambda: (
         target if p.robot.arm.set_position.call_count == 2 else start, None)
+    p.plan = transfer_plan.prepare_transfer(p.robot, p.pre, p.lift, p.cfg, p.drop)
     return p
 
 
 def test_lift_stops_before_joint_transfer_and_preserves_clearance(transfer):
     p = transfer
-    assert motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     retreat, rise = p.robot.arm.set_position.call_args_list
     np.testing.assert_allclose(retreat.args, motion.se3_to_xarm_pose(p.pre))
     assert retreat.kwargs["radius"] == 5
@@ -169,12 +173,10 @@ def test_lift_stops_before_joint_transfer_and_preserves_clearance(transfer):
     p.robot.stop_motion.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", ["ik", "lift", "drop", "arrival", "state", "queue", "c24"])
+@pytest.mark.parametrize("failure", ["lift", "drop", "arrival", "state", "queue", "c24"])
 def test_transfer_failures_stop_without_fallback_or_release(transfer, failure):
     p = transfer
-    if failure == "ik":
-        p.robot.check_flange_ik.return_value = False
-    elif failure == "lift":
+    if failure == "lift":
         p.robot.arm.set_position.return_value = 9
     elif failure == "drop":
         p.robot.arm.set_servo_angle.return_value = 9
@@ -188,11 +190,11 @@ def test_transfer_failures_stop_without_fallback_or_release(transfer, failure):
         p.robot.arm.get_position.return_value = 0, [300., 0., 250., 180., 0., 0.]
     else:
         p.robot.arm.get_cmdnum.return_value = 0, 1
-    assert not motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    assert not motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     p.robot.stop_motion.assert_called_once()
     p.robot.move_joints.assert_not_called()
     p.robot.arm.clean_error.assert_not_called()
-    if failure in ("ik", "lift", "state", "queue", "c24"):
+    if failure in ("lift", "state", "queue", "c24"):
         p.robot.arm.set_servo_angle.assert_not_called()
 
 
@@ -207,7 +209,7 @@ def test_camera_disconnect_cancels_lift_or_queued_transfer(transfer, after_drop)
             raise CameraError("disconnected")
 
     with pytest.raises(CameraError):
-        motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop, check)
+        motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop, check)
     p.robot.stop_motion.assert_called_once()
     assert p.robot.arm.set_servo_angle.call_count == int(after_drop)
 
@@ -216,11 +218,11 @@ def test_large_rotation_limits_reorientation_speed():
     start, end = np.eye(4), np.eye(4)
     end[2, 3] = .1
     end[:3, :3] = np.diag([1., -1., -1.])
-    speed, angle = motion.reorientation_speed(start, end, {"lift_speed_mm_s": 500})
+    speed, angle = transfer_plan.reorientation_speed(start, end, {"lift_speed_mm_s": 500})
     assert angle == pytest.approx(180.)
     assert speed == pytest.approx(100 * 30 / 180)
     end[:3, :3] = np.eye(3)
-    speed, angle = motion.reorientation_speed(start, end, {"lift_speed_mm_s": 500})
+    speed, angle = transfer_plan.reorientation_speed(start, end, {"lift_speed_mm_s": 500})
     assert speed == 100
 
 
@@ -228,7 +230,7 @@ def test_retreat_and_reorientation_use_distinct_speeds(transfer):
     p = transfer
     p.cfg.update(retreat_speed_mm_s=140, reorient_speed_mm_s=80,
                  reorient_acc_mm_s2=125, reorient_angular_speed_deg_s=20)
-    assert motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     retreat, rise = p.robot.arm.set_position.call_args_list
     assert retreat.kwargs["speed"] == 140
     assert rise.kwargs["speed"] == pytest.approx(110 * 20 / 180)
@@ -246,7 +248,7 @@ def test_joint_command_is_not_sent_until_cartesian_settled(transfer):
         return 0
 
     p.robot.arm.set_servo_angle.side_effect = joint_command
-    assert motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
 
 
 def test_stopped_short_of_upper_target_never_queues_joint_motion(transfer):
@@ -254,7 +256,7 @@ def test_stopped_short_of_upper_target_never_queues_joint_motion(transfer):
     position = np.eye(4)
     position[2, 3] = .4
     p.robot.get_tcp_pose.side_effect = lambda: (position, None)
-    assert not motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    assert not motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     p.robot.arm.set_servo_angle.assert_not_called()
     p.robot.stop_motion.assert_called_once()
 
@@ -269,7 +271,7 @@ def test_joint_acceleration_is_configurable_and_stage_starts_after_stop(transfer
         p.robot.arm.set_servo_angle.assert_not_called()
         stages.append(name)
 
-    assert motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop, on_stage=stage)
+    assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop, on_stage=stage)
     assert p.robot.arm.set_servo_angle.call_args.kwargs["mvacc"] == 100
     assert stages == ["Joint transfer"]
 
@@ -278,7 +280,7 @@ def test_joint_acceleration_is_configurable_and_stage_starts_after_stop(transfer
 def test_invalid_transfer_acceleration_prevents_any_move(transfer, value):
     p = transfer
     p.drop["joint_acc_deg_s2"] = value
-    assert not motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    assert not motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     p.robot.arm.set_position.assert_not_called()
     p.robot.arm.set_servo_angle.assert_not_called()
 
@@ -316,7 +318,7 @@ def test_short_transfer_confirmation_preserves_stop_barrier(transfer, monkeypatc
     p.robot.arm.set_servo_angle.side_effect = joint_command
     metrics = {"stale": True}
     assert motion.lift_and_transfer_blended(
-        p.robot, p.pre, p.lift, p.cfg, p.drop, metrics=metrics)
+        p.robot, p.plan, p.cfg, p.drop, metrics=metrics)
     assert "stale" not in metrics
     assert metrics["upper_confirm_s"] == pytest.approx(.1)
     assert metrics["arrival_confirm_s"] == pytest.approx(.06)
@@ -333,7 +335,7 @@ def test_invalid_confirmation_prevents_motion(transfer, value, key):
         ok = motion.approach_blended(p.robot, p.pre, p.grasp, p.cfg)
     else:
         p.drop[key] = value
-        ok = motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+        ok = motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     assert not ok
     p.robot.arm.set_position.assert_not_called()
     p.robot.arm.set_servo_angle.assert_not_called()
@@ -343,15 +345,16 @@ def test_invalid_confirmation_prevents_motion(transfer, value, key):
 def test_retreat_rounding_is_limited_by_clearance(transfer, radius, expected):
     p = transfer
     p.pre[2, 3] = .41  # Only 10 mm above initial TCP.
+    p.plan = transfer_plan.prepare_transfer(p.robot, p.pre, p.lift, p.cfg, p.drop)
     p.cfg["retreat_blend_radius_mm"] = radius
-    assert motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     assert p.robot.arm.set_position.call_args_list[0].kwargs["radius"] == pytest.approx(expected)
 
 
 def test_selected_upper_symmetry_is_executed_without_changing_clearance(transfer):
     p = transfer
-    target, _ = motion.transfer_waypoint(p.pre, p.lift, p.drop, p.robot.R_home_tcp, -1)
-    original, _ = motion.transfer_waypoint(p.pre, p.lift, p.drop, p.robot.R_home_tcp)
+    target, _ = transfer_plan.transfer_waypoint(p.pre, p.lift, p.drop, p.robot.R_home_tcp, -1)
+    original, _ = transfer_plan.transfer_waypoint(p.pre, p.lift, p.drop, p.robot.R_home_tcp)
     np.testing.assert_array_equal(target[:3, 3], original[:3, 3])
     np.testing.assert_array_equal(target[:3, 2], original[:3, 2])
     np.testing.assert_array_equal(target[:3, :2], -original[:3, :2])
@@ -360,45 +363,52 @@ def test_selected_upper_symmetry_is_executed_without_changing_clearance(transfer
     p.robot.get_tcp_pose.side_effect = lambda: (
         target if p.robot.arm.set_position.call_count == 2 else start, None)
     p.robot.flange_ik_joints_deg.return_value = [0.] * 7
-    assert motion.lift_and_transfer_blended(
+    p.plan = transfer_plan.prepare_transfer(
         p.robot, p.pre, p.lift, p.cfg, p.drop, transfer_sign=-1, j7_limits=[-89, 90])
+    assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     np.testing.assert_allclose(p.robot.arm.set_position.call_args.args,
                                motion.se3_to_xarm_pose(target))
     assert p.robot.arm.set_position.call_args.kwargs['radius'] == -1
 
 
-def test_changed_upper_ik_branch_blocks_transfer_before_any_move(transfer):
+@pytest.mark.parametrize("changed", ["tcp", "joints"])
+def test_changed_start_blocks_execution_of_prepared_plan(transfer, changed):
     p = transfer
-    p.robot.flange_ik_joints_deg.side_effect = [[0.] * 7, [0.] * 6 + [100.]]
-    assert not motion.lift_and_transfer_blended(
-        p.robot, p.pre, p.lift, p.cfg, p.drop, transfer_sign=-1, j7_limits=[-89, 90])
+    if changed == "tcp":
+        pose = p.plan.start_tcp.copy()
+        pose[0, 3] += .003
+        p.robot.get_tcp_pose.side_effect = lambda: (pose, None)
+    else:
+        p.robot.get_joints_deg.return_value = [1.] * 7
+    assert not motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     p.robot.arm.set_position.assert_not_called()
     p.robot.arm.set_servo_angle.assert_not_called()
     p.robot.stop_motion.assert_called_once()
 
 
-def test_midrise_ik_failure_blocks_all_motion_even_with_valid_endpoints(transfer):
+def test_execution_uses_prepared_geometry_without_replanning(transfer):
     p = transfer
-    p.robot.flange_ik_joints_deg.side_effect = lambda T: (
-        None if .54 < T[2, 3] < .57 else [0.] * 7)
-    assert not motion.lift_and_transfer_blended(
-        p.robot, p.pre, p.lift, p.cfg, p.drop, j7_limits=[-89, 90])
-    p.robot.arm.set_position.assert_not_called()
-    p.robot.arm.set_servo_angle.assert_not_called()
-    p.robot.arm.clean_error.assert_not_called()
+    p.robot.flange_ik_joints_deg.reset_mock()
+    p.robot.flange_ik_joints_deg.side_effect = AssertionError("unexpected IK during execution")
+    assert motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
+    rise = p.robot.arm.set_position.call_args_list[1]
+    np.testing.assert_allclose(rise.args, motion.se3_to_xarm_pose(p.plan.upper))
+    p.robot.flange_ik_joints_deg.assert_not_called()
 
 
 def test_c21_rise_captures_pose_before_stop_and_does_not_transfer(transfer, capsys):
     p = transfer
-    p.robot.arm.get_state.return_value = 0, 4
-    p.robot.arm.get_err_warn_code.return_value = 0, [21, 14]
+    p.robot.arm.get_state.side_effect = lambda: (
+        0, 4 if p.robot.arm.set_position.call_count == 2 else 2)
+    p.robot.arm.get_err_warn_code.side_effect = lambda: (
+        0, [21, 14] if p.robot.arm.set_position.call_count == 2 else [0, 0])
 
     def read_pose(**kwargs):
         p.robot.stop_motion.assert_not_called()
         return 0, [537., -189., 300., 180., 0., 0.]
 
     p.robot.arm.get_position.side_effect = read_pose
-    assert not motion.lift_and_transfer_blended(p.robot, p.pre, p.lift, p.cfg, p.drop)
+    assert not motion.lift_and_transfer_blended(p.robot, p.plan, p.cfg, p.drop)
     output = capsys.readouterr().out
     assert 'error=21, warn=14' in output
     assert '실측 TCP' in output and '실측 관절' in output and '상승 목표' in output
@@ -413,8 +423,8 @@ def test_rise_sampling_includes_rotation_and_correct_flange_offset():
     robot.flange_ik_joints_deg.return_value = [0.] * 7
     start, target = np.eye(4), np.eye(4)
     target[2, 3] = .02
-    target[:3, :3] = motion.Rotation.from_euler('y', 30, degrees=True).as_matrix()
-    assert motion.rise_path_error(robot, start, target, {}) is None
+    target[:3, :3] = Rotation.from_euler('y', 30, degrees=True).as_matrix()
+    assert transfer_plan.rise_path_error(robot, start, target, {}) is None
     calls = robot.flange_ik_joints_deg.call_args_list
     assert len(calls) == 5  # 30 degrees / 5, excluding both endpoints
     middle_tcp = calls[2].args[0] @ robot.T_flange_tcp

@@ -33,7 +33,8 @@ def xarm_pose_to_se3(pose_mm_rad):
 
 def se3_to_xarm_pose(T):
     """4x4 SE(3) in meters -> xArm [x, y, z (mm), roll, pitch, yaw (rad)]."""
-    rpy = Rotation.from_matrix(T[:3, :3]).as_euler("xyz")
+    # Older SciPy requires a writable buffer, including for immutable plans.
+    rpy = Rotation.from_matrix(T[:3, :3].copy()).as_euler("xyz")
     t = T[:3, 3] * 1000.0
     return [t[0], t[1], t[2], rpy[0], rpy[1], rpy[2]]
 

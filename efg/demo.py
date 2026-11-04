@@ -26,7 +26,8 @@ from .config import get, require
 from . import console
 from .detectors import build_detector
 from .floor import FloorMap, clamp_to_floor
-from .motion import connect_robot, go_home, move_tcp, approach_blended, lift_and_transfer_blended, transfer_waypoint
+from .motion import connect_robot, go_home, move_tcp, approach_blended, lift_and_transfer_blended
+from .transfer_plan import prepare_transfer, transfer_waypoint
 from .payload import load_payload_check
 from .perception import detect_frame
 from .postprocess import mask_depth_to_roi, uses_standalone_foundgrasp
@@ -34,7 +35,7 @@ from .recording import write_manifest, save_detection
 from .roi import draw_overlay, exclude_near, project_px
 from .se3 import inv_se3, pose_delta
 from .selection import select_grasp
-from .transforms import load_hand_eye
+from .transforms import load_hand_eye, camera_lateral_dir_tcp
 from .timing import CycleTiming, TaktStats
 from .viz import draw_score_grippers, gripper_segments_px
 from .viz_rerun import RerunViz
@@ -112,6 +113,7 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
                 "Pre-grasp / opening": "pre-grasp(폭 조절 병행)",
                 "Waiting for approach confirmation": "사용자 확인",
                 "Approaching": "접근",
+                "Preparing transfer": "상승 계획",
                 "Reopening / retracting": "실패 후 복귀",
             }
             timing.mark(labels.get(name, name))
@@ -139,11 +141,6 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
             if (joints is None or len(joints) != 7 or not np.isfinite(joints).all()
                     or not lo <= joints[6] <= hi):
                 return "abort", "선정 경로 사전 IK/J7 재검사"
-    if timing is not None:
-        angle = pose_delta(sel.T_tcp_pre, T_transfer)[1]
-        timing.notes.append(f"상승 방향 {'홈' if transfer_sign == 1 else '홈의 180° 대칭'} · "
-                            f"TCP 자세 전환 {angle:.1f}°")
-
     # 기본 모드에서는 pre-grasp 이동 중 폭 조절, 완료 확인 후 최종 접근한다.
     # 최초 활성화 후에는 준비 상태만 확인하며 재활성화 대기를 반복하지 않는다.
     robot.enable_motion()
@@ -211,6 +208,38 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
 
     if auto:
         check_approach()
+
+    def check_transfer():
+        if stream is not None:
+            stream.raise_if_failed()
+        if stop is not None and stop.requested:
+            raise RuntimeError("사용자 정지 요청")
+
+    # Home-state IK is only a candidate screen. Finalize the return route at
+    # the measured grasp state, before holding an object; execute that same plan.
+    phase("Preparing transfer")
+    camera_up = cfg.get("selection", {}).get("camera_up") or {}
+    direction = (camera_lateral_dir_tcp(cfg, robot)
+                 if camera_up.get("prefer", False) else None)
+    constraint = None if direction is None else (
+        direction, -np.sin(np.radians(float(camera_up.get("max_down_deg", 20.)))))
+    try:
+        plan = prepare_transfer(
+            robot, sel.T_tcp_pre, sel.T_tcp_lift, r, d, transfer_sign=transfer_sign,
+            j7_limits=cfg.get("selection", {}).get("j7_limit_deg", [-89., 90.]),
+            camera_up=constraint, allow_symmetry=True, check=check_transfer)
+    except CameraError:
+        raise
+    except RuntimeError as exc:
+        print(f"[robot] {exc}")
+        return "abort", "상승 경로 준비"
+    if plan.transfer_sign != transfer_sign:
+        console.row("상승 계획", f"실측 자세에서 대칭 방향 변경 {transfer_sign:+d} → {plan.transfer_sign:+d}")
+    if timing is not None:
+        angle = pose_delta(plan.pre, plan.upper)[1]
+        timing.notes.append(f"상승 방향 {'홈' if plan.transfer_sign == 1 else '홈의 180° 대칭'} · "
+                            f"TCP 자세 전환 {angle:.1f}°")
+
     phase("Closing gripper")
     ok, pos = gripper.grip()
     console.detail(f"닫힘: finger {pos}% · 판정 {'적용' if grip_check else '미적용'}")
@@ -223,17 +252,10 @@ def pick_and_place(robot, gripper, sel, cfg, auto, payload=None,
 
     phase("Retreat / rise / stop / transfer")
 
-    def check_transfer():
-        if stream is not None:
-            stream.raise_if_failed()
-        if stop is not None and stop.requested:
-            raise RuntimeError("사용자 정지 요청")
-
     transfer_metrics = {}
-    if not lift_and_transfer_blended(robot, sel.T_tcp_pre, sel.T_tcp_lift, r, d,
+    if not lift_and_transfer_blended(robot, plan, r, d,
                                      check=check_transfer, on_stage=phase,
-                                     metrics=transfer_metrics, transfer_sign=transfer_sign,
-                                     j7_limits=cfg.get("selection", {}).get("j7_limit_deg", [-89., 90.])):
+                                     metrics=transfer_metrics):
         return "abort", "상승/이송 이동"
     if timing is not None and transfer_metrics:
         timing.notes.append(

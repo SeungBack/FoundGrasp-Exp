@@ -66,3 +66,18 @@ def approach_tilt_deg(R_base_grasp):
     a = a / np.linalg.norm(a)
     cos = np.clip(np.dot(a, np.array([0.0, 0.0, -1.0])), -1.0, 1.0)
     return float(np.degrees(np.arccos(cos)))
+
+
+def camera_lateral_dir_tcp(cfg, robot):
+    """손목 카메라 돌출 방향의 툴 z 수직 성분 (TCP 프레임 단위 벡터).
+
+    hand-eye 병진(플랜지→카메라)을 TCP 프레임으로 돌린 뒤 툴 축(z) 성분을
+    제거 — 그립 자세 회전을 곱하면 base에서 카메라가 향하는 쪽이 된다.
+    robot이 None이면 플랜지≈TCP 회전으로 근사한다.
+    """
+    u = load_hand_eye(cfg["calib"]["hand_eye"])[:3, 3]
+    if robot is not None:
+        u = robot.T_flange_tcp[:3, :3].T @ u
+    u[2] = 0.0
+    n = np.linalg.norm(u)
+    return u / n if n > 1e-6 else None

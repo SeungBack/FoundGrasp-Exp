@@ -32,6 +32,9 @@ def setup_pick(monkeypatch):
     robot.T_flange_tcp = np.eye(4)
     robot.R_home_tcp = np.eye(3)
     robot.check_flange_ik.return_value = True
+    robot.arm.get_state.return_value = 0, 2
+    robot.arm.get_cmdnum.return_value = 0, 0
+    robot.arm.get_err_warn_code.return_value = 0, [0, 0]
     gripper = Mock()
     gripper.pre_open.return_value = True
     stream = FakeStream()
@@ -42,6 +45,9 @@ def setup_pick(monkeypatch):
     selected.T_tcp_pre[2, 3] = 0.2
     selected.T_tcp_grasp[2, 3] = 0.1
     selected.T_tcp_lift[2, 3] = 0.3
+    robot.get_tcp_pose.return_value = selected.T_tcp_grasp, None
+    robot.get_joints_deg.return_value = [0.] * 7
+    robot.flange_ik_joints_deg.return_value = [0.] * 7
     cfg = {
         "robot": {"travel_speed_mm_s": 100, "approach_speed_mm_s": 20,
                   "lift_speed_mm_s": 100, "approach_acc_mm_s2": 100},
@@ -233,7 +239,7 @@ def test_release_requires_completed_transfer(setup_pick, monkeypatch, arrived, o
         p.gripper.grip.assert_called_once()
         p.gripper.release.assert_not_called()
         kwargs["check"]()
-        assert kwargs['transfer_sign'] == -1
+        assert args[1].transfer_sign == -1
         checked_pose = p.robot.check_flange_ik.call_args.args[0]
         np.testing.assert_array_equal(checked_pose[:3, :3], np.diag([-1., -1., 1.]))
         return arrived
@@ -249,6 +255,71 @@ def test_release_requires_completed_transfer(setup_pick, monkeypatch, arrived, o
         assert result == ("abort", "상승/이송 이동")
         p.gripper.release.assert_not_called()
     p.move.assert_not_called()
+
+
+@pytest.mark.parametrize("blocked", ["pre", "both_upper"])
+def test_actual_grasp_state_without_return_route_never_closes(setup_pick, monkeypatch, blocked):
+    p = setup_pick
+    p.cfg['selection'] = {'ik_check_per_candidate': True}
+    at_grasp = False
+
+    def approach(*args, **kwargs):
+        nonlocal at_grasp
+        at_grasp = True
+        return True
+
+    def ik(target):
+        # Selection/home checks pass, but IK differs after reaching the grasp.
+        if at_grasp and (blocked == 'pre' or target[2, 3] > .3):
+            return [0.] * 6 + [104.]
+        return [0.] * 7
+
+    p.robot.flange_ik_joints_deg.side_effect = ik
+    monkeypatch.setattr(demo, 'approach_blended', approach)
+    transfer = Mock()
+    monkeypatch.setattr(demo, 'lift_and_transfer_blended', transfer)
+    assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                               auto=True, stream=p.stream) == ('abort', '상승 경로 준비')
+    p.gripper.grip.assert_not_called()
+    p.gripper.release.assert_not_called()
+    transfer.assert_not_called()
+
+
+def test_actual_state_alternate_is_prepared_before_closing_then_executed(setup_pick, monkeypatch):
+    p = setup_pick
+    p.cfg['selection'] = {'ik_check_per_candidate': True}
+    at_grasp = False
+    queries_when_closed = []
+
+    def approach(*args, **kwargs):
+        nonlocal at_grasp
+        at_grasp = True
+        return True
+
+    def ik(target):
+        p.gripper.grip.assert_not_called()
+        if at_grasp and target[2, 3] > .3 and target[0, 0] > 0:
+            return [0.] * 6 + [104.]
+        return [0.] * 7
+
+    def close():
+        queries_when_closed.append(p.robot.flange_ik_joints_deg.call_count)
+        return True, 40.
+
+    def transfer(robot, plan, *args, **kwargs):
+        assert plan.transfer_sign == -1
+        np.testing.assert_array_equal(plan.pre, p.selected.T_tcp_pre)
+        assert p.robot.flange_ik_joints_deg.call_count == queries_when_closed[0]
+        p.gripper.grip.assert_called_once()
+        return True
+
+    p.robot.flange_ik_joints_deg.side_effect = ik
+    p.gripper.grip.side_effect = close
+    p.gripper.release.return_value = True
+    monkeypatch.setattr(demo, 'approach_blended', approach)
+    monkeypatch.setattr(demo, 'lift_and_transfer_blended', transfer)
+    assert demo.pick_and_place(p.robot, p.gripper, p.selected, p.cfg,
+                               auto=True, stream=p.stream) == ('success', None)
 
 
 @pytest.mark.parametrize("retry_mode", ["none", "empty", "selection", "exhausted",

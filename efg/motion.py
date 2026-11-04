@@ -2,10 +2,10 @@
 import time
 
 import numpy as np
-from scipy.spatial.transform import Rotation, Slerp
 
 from .robot import XArm7
 from .console import detail
+from .transfer_plan import reorientation_speed
 from .se3 import inv_se3, pose_delta, se3_to_xarm_pose
 
 
@@ -104,76 +104,6 @@ def approach_blended(robot, T_pre, T_grasp, cfg, check=None, prepare=None, metri
         raise
 
 
-def transfer_waypoint(T_pre, T_lift, drop_cfg, R_home_tcp, closing_sign=1):
-    """Rise at fixed XY toward home or its tool-z half-turn equivalent."""
-    if closing_sign not in (1, -1):
-        raise RuntimeError("잘못된 상승 대칭 방향")
-    radius = float(drop_cfg.get("transfer_clearance_margin_mm",
-                                drop_cfg.get("lift_blend_radius_mm", 10)))
-    if not np.isfinite(radius) or radius <= 0:
-        raise RuntimeError("상승 높이 여유는 양수여야 합니다")
-    rotation = np.asarray(R_home_tcp, dtype=float)
-    if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
-        raise RuntimeError("홈 TCP 자세 기록이 없습니다")
-    target = T_pre.copy()
-    clearance = max(float(T_lift[2, 3]), float(drop_cfg.get("via_height_m", .35)),
-                    float(T_pre[2, 3]) + .05)
-    radius = min(radius, (clearance - T_pre[2, 3]) * 1000 * .25)
-    target[2, 3] = clearance + radius / 1000
-    target[:3, :3] = rotation @ np.diag([closing_sign, closing_sign, 1.])
-    return target, radius
-
-
-def reorientation_speed(T_start, T_end, cfg):
-    """Conservative translation-speed cap from required TCP rotation time.
-
-    This is a path-average planning heuristic, not a joint velocity guarantee.
-    Controller speed/singularity protection remains enabled.
-    """
-    distance, angle = pose_delta(T_start, T_end)
-    speed = min(float(cfg["lift_speed_mm_s"]),
-                float(cfg.get("reorient_speed_mm_s", 100)))
-    angular_rate = float(cfg.get("reorient_angular_speed_deg_s", 30))
-    if not np.isfinite([speed, angular_rate]).all() or min(speed, angular_rate) <= 0:
-        raise RuntimeError("자세 전환 속도 설정은 유한한 양수여야 합니다")
-    if angle > 1e-3:
-        speed = min(speed, distance * 1000 * angular_rate / angle)
-    if speed < 1:
-        raise RuntimeError("자세 전환 거리가 회전량에 비해 너무 짧습니다")
-    return speed, angle
-
-
-def rise_path_error(robot, start, target, cfg, j7_limits=None, check=None):
-    """Sample nominal straight rise + shortest rotation; return rejection reason.
-
-    Feasibility screening only: SDK endpoint IK cannot certify the controller's
-    blended trajectory, branch continuity, singularities or swept collisions.
-    In particular, firmware 2.7.1 ignores the SDK's ref_angles parameter.
-    """
-    step_mm = float(cfg.get("rise_ik_step_mm", 20))
-    step_deg = float(cfg.get("rise_ik_step_deg", 5))
-    if not np.isfinite([step_mm, step_deg]).all() or min(step_mm, step_deg) <= 0:
-        raise ValueError("상승 IK 검사 간격은 유한한 양수여야 합니다")
-    distance, angle = pose_delta(start, target)
-    count = max(2, int(np.ceil(max(distance * 1000 / step_mm, angle / step_deg))))
-    rotations = Slerp([0., 1.], Rotation.from_matrix(np.stack(
-        [start[:3, :3], target[:3, :3]])))
-    for i in range(1, count):
-        if check:
-            check()
-        fraction = i / count
-        T = np.eye(4)
-        T[:3, 3] = start[:3, 3] * (1 - fraction) + target[:3, 3] * fraction
-        T[:3, :3] = rotations(fraction).as_matrix()
-        q = robot.flange_ik_joints_deg(T @ inv_se3(robot.T_flange_tcp))
-        location = f"상승 경로 {fraction:.0%}, z={T[2, 3] * 1000:.1f}mm"
-        if q is None or np.shape(q) != (7,) or not np.isfinite(q).all():
-            return f"IK 불가 ({location})"
-        if j7_limits is not None and not j7_limits[0] <= q[6] <= j7_limits[1]:
-            return f"J7 {q[6]:.1f}° 제한 초과 ({location})"
-    return None
-
-
 def _rise_diagnostics(robot, target):
     """Best-effort read-only snapshot before our stop request obscures state."""
     for label, read in (
@@ -219,12 +149,11 @@ def wait_tcp_stopped(robot, target, timeout_s, check=None, confirm_s=.2):
     raise RuntimeError("상승 정지/목표 도착 확인 시간 초과 — 조인트 이송 미전송")
 
 
-def lift_and_transfer_blended(robot, T_pre, T_lift, robot_cfg, drop_cfg, check=None,
-                              on_stage=None, metrics=None, transfer_sign=1,
-                              j7_limits=None):
-    """Retreat to pre-grasp, rise while adopting home orientation, then transfer.
+def lift_and_transfer_blended(robot, plan, robot_cfg, drop_cfg, check=None,
+                              on_stage=None, metrics=None):
+    """Execute a prepared retreat/rise, then transfer to the release pose.
 
-    Plan before enqueueing. Never retry via another route after partial enqueue.
+    Reject a changed start state. Never replan or retry after partial enqueue.
     Cartesian retreat/rise can blend; joint transfer starts only after a verified stop.
     """
     if metrics is not None:
@@ -234,30 +163,14 @@ def lift_and_transfer_blended(robot, T_pre, T_lift, robot_cfg, drop_cfg, check=N
         release_confirm_s = _confirm_time(drop_cfg, "arrival_confirm_s")
         if check:
             check()
-        current, _ = robot.get_tcp_pose()
-        target, radius = transfer_waypoint(
-            T_pre, T_lift, drop_cfg, robot.R_home_tcp, closing_sign=transfer_sign)
-        if T_pre[2, 3] <= current[2, 3]:
-            raise RuntimeError("after-grasp 복귀 목표가 현재 위치보다 높지 않습니다")
+        plan.check_start(robot)
+        current, T_pre, target = plan.start_tcp, plan.pre, plan.upper
         retreat_radius = float(robot_cfg.get("retreat_blend_radius_mm", 5))
         if not np.isfinite(retreat_radius) or retreat_radius < 0:
             raise RuntimeError("잘못된 복귀 블렌딩 반경")
         retreat_radius = min(retreat_radius, np.linalg.norm(T_pre[:3, 3] - current[:3, 3]) * 250,
                              (target[2, 3] - T_pre[2, 3]) * 250)
         retreat_radius = retreat_radius if retreat_radius > .01 else -1
-        # Validate the raised waypoint before moving a held object.
-        if not all(robot.check_flange_ik(T @ inv_se3(robot.T_flange_tcp))
-                   for T in (T_pre, target)):
-            raise RuntimeError("상승 경유점 IK 실패")
-        if j7_limits is not None:
-            for T in (T_pre, target):
-                angles = robot.flange_ik_joints_deg(T @ inv_se3(robot.T_flange_tcp))
-                if (angles is None or len(angles) != 7 or not np.isfinite(angles).all()
-                        or not j7_limits[0] <= angles[6] <= j7_limits[1]):
-                    raise RuntimeError("상승 경유점 J7 제한/IK 재검사 실패")
-        path_error = rise_path_error(robot, T_pre, target, robot_cfg, j7_limits, check)
-        if path_error:
-            raise RuntimeError(path_error)
         joints = np.asarray(drop_cfg["joints_deg"], dtype=float)
         if joints.shape != (7,) or not np.isfinite(joints).all():
             raise RuntimeError("잘못된 릴리즈 관절 목표")
@@ -269,7 +182,7 @@ def lift_and_transfer_blended(robot, T_pre, T_lift, robot_cfg, drop_cfg, check=N
                             float(robot_cfg.get("retreat_speed_mm_s", 150)))
         joint_speed = float(drop_cfg["joint_speed_deg_s"])
         detail(f"복귀 {retreat_speed:.0f}mm/s → 자세 전환 {rise_speed:.1f}mm/s "
-              f"(TCP 회전 {angle:.1f}°, 상승 대칭 {transfer_sign:+d}) "
+              f"(TCP 회전 {angle:.1f}°, 상승 대칭 {plan.transfer_sign:+d}) "
               f"→ 정지 확인 → 이송 {joint_speed:.0f}°/s")
         rise_started = time.perf_counter()
         for waypoint, blend, speed, acc in (

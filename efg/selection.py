@@ -11,10 +11,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .motion import transfer_waypoint, rise_path_error
+from .transfer_plan import transfer_waypoint, rise_path_error
 from .console import detail
 from .transforms import (approach_tilt_deg, grasp_to_base, lifted,
                          offset_along_tool_z, tool_pose_from_grasp)
+from .transforms import camera_lateral_dir_tcp as _camera_lateral_dir_tcp
 
 
 @dataclass
@@ -70,22 +71,6 @@ def _joint_route_cost(*waypoints):
     """
     changes = np.abs(np.diff(np.asarray(waypoints, dtype=float), axis=0))
     return float(changes.max(axis=1).sum()), float(changes.sum())
-
-
-def _camera_lateral_dir_tcp(cfg, robot):
-    """손목 카메라 돌출 방향의 툴 z 수직 성분 (TCP 프레임 단위 벡터).
-
-    hand-eye 병진(플랜지→카메라)을 TCP 프레임으로 돌린 뒤 툴 축(z) 성분을
-    제거 — 그립 자세 회전을 곱하면 base에서 카메라가 향하는 쪽이 된다.
-    robot이 None이면 플랜지≈TCP 회전으로 근사한다.
-    """
-    from .transforms import load_hand_eye
-    u = load_hand_eye(cfg["calib"]["hand_eye"])[:3, 3]
-    if robot is not None:
-        u = robot.T_flange_tcp[:3, :3].T @ u
-    u[2] = 0.0
-    n = np.linalg.norm(u)
-    return u / n if n > 1e-6 else None
 
 
 def select_grasp(gg, T_base_cam, cfg, robot=None):
