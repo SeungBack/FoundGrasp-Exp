@@ -1,5 +1,6 @@
 # Based on FoundGrasp sim/worker_protocol.py. Array wire format remains compatible;
-# local workers additionally publish optional per-request timing sidecars.
+# local workers additionally publish optional per-request timing sidecars and
+# accept calibrated capture-time pose for methods that require table geometry.
 """baseline 워커 <-> 시뮬 드라이버 파일 기반 프로토콜.
 
 baseline들은 서로 다른 conda env(tta-grasp/hggd/cgnet/GraspSAM)에서 돌아야
@@ -7,6 +8,10 @@ baseline들은 서로 다른 conda env(tta-grasp/hggd/cgnet/GraspSAM)에서 돌�
 
   드라이버(vit-grasp env):  req_{i:06d}.npz  {rgb(H,W,3 u8), depth(H,W f32 m), K(3,3)}
   워커(baseline env):       res_{i:06d}.npy  (N,17) float64 GraspGroup 배열 (camera frame)
+
+  선택 입력: T_base_cam (4,4, 미터), 카메라 optical frame → 로봇 베이스.
+  GFLA만 이 변환을 인식에 사용하며 작업대 좌표계=베이스를 가정한다.
+  다른 워커의 기존 RGB-D/K 요청 형식은 그대로 유지한다.
 
 워커는 시작 시 모델을 1회 로드하고 요청 폴더를 폴링한다 (호출마다 프로세스를
 띄우면 모델 로드 10~20초 x 수백 attempt라 비실용적). 부분 파일 읽기를 막기 위해
@@ -24,6 +29,17 @@ import inspect
 import numpy as np
 
 STOP_FILE = 'stop'
+
+
+def validate_camera_pose(T_base_cam):
+    """Camera optical frame -> robot base, a rigid 4x4 transform in metres."""
+    T = np.asarray(T_base_cam, dtype=np.float64)
+    if (T.shape != (4, 4) or not np.isfinite(T).all()
+            or not np.allclose(T[3], [0., 0., 0., 1.], atol=1e-8, rtol=0)
+            or not np.allclose(T[:3, :3] @ T[:3, :3].T, np.eye(3), atol=1e-5, rtol=0)
+            or not np.isclose(np.linalg.det(T[:3, :3]), 1., atol=1e-5, rtol=0)):
+        raise ValueError('T_base_cam must be a finite rigid 4x4 camera-to-base transform in metres')
+    return T.copy()
 
 
 def _atomic_save_npy(path, arr):
@@ -67,13 +83,17 @@ def serve(work_dir, predict_fn, poll_interval=0.05, synchronize=None):
             with np.load(req_path) as data:
                 rgb, depth, K = data['rgb'], data['depth'], data['K']
                 mask = data['mask'] if 'mask' in data.files else None
+                camera_pose = data['T_base_cam'] if 'T_base_cam' in data.files else None
             if synchronize:
                 synchronize()
             t0 = time.perf_counter()
-            if mask is not None and 'mask' in inspect.signature(predict_fn).parameters:
-                gg = np.asarray(predict_fn(rgb, depth, K, mask=mask), dtype=np.float64)
-            else:
-                gg = np.asarray(predict_fn(rgb, depth, K), dtype=np.float64)
+            parameters = inspect.signature(predict_fn).parameters
+            context = {}
+            if mask is not None and 'mask' in parameters:
+                context['mask'] = mask
+            if camera_pose is not None and 'T_base_cam' in parameters:
+                context['T_base_cam'] = validate_camera_pose(camera_pose)
+            gg = np.asarray(predict_fn(rgb, depth, K, **context), dtype=np.float64)
             if synchronize:
                 synchronize()
             inference_ms = (time.perf_counter() - t0) * 1000
@@ -123,14 +143,15 @@ class WorkerClient:
         self.last_metrics = None
         os.makedirs(work_dir, exist_ok=True)
 
-    def request(self, rgb, depth, K, mask=None):
+    def request(self, rgb, depth, K, mask=None, *, T_base_cam=None):
         self.last_metrics = None
         req_id = f'{self._next_id:06d}'
         self._next_id += 1
+        context = {} if T_base_cam is None else {'T_base_cam': validate_camera_pose(T_base_cam)}
         atomic_save_npz(os.path.join(self.work_dir, f'req_{req_id}.npz'),
                         rgb=rgb.astype(np.uint8), depth=depth.astype(np.float32),
                         K=K.astype(np.float64),
-                        **({'mask': mask.astype(np.uint8)} if mask is not None else {}))
+                        **({'mask': mask.astype(np.uint8)} if mask is not None else {}), **context)
         res_path = os.path.join(self.work_dir, f'res_{req_id}.npy')
         err_path = os.path.join(self.work_dir, f'err_{req_id}.txt')
         deadline = time.monotonic() + self.timeout

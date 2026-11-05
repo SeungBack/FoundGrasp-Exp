@@ -1,8 +1,8 @@
 """스캔 영역(ROI) — 이미지 2D 사각형으로 그립 후보 필터·시각화.
 
-FoundGrasp는 전체 프레임으로 추론하고, 후보 그립 중심을 K로 이미지에
-투영해 ROI 내부만 남긴다 (입력 마스킹은 depth 경계 왜곡을 만들 수 있어
-후처리 필터를 택함). 박스 테두리 등 영역 밖 그립이 제거된다.
+공유 추론 경로는 설정에 따라 ROI 밖 depth를 무효화하고, 검출 후에는
+후보 그립 중심을 K로 투영해 ROI 내부만 남긴다. ROI가 None이면 입력
+마스킹과 이 투영 필터를 모두 생략한다.
 """
 import numpy as np
 
@@ -25,7 +25,7 @@ def filter_roi(gg, K, roi_px):
     """GraspGroup에서 그립 중심 투영이 ROI 내부인 후보만 반환 (score 순 유지)."""
     GraspGroup = import_grasp_group()
 
-    if len(gg) == 0:
+    if roi_px is None or len(gg) == 0:
         return gg
     x1, y1, x2, y2 = roi_px
     uv = project_px(gg.translations, K)

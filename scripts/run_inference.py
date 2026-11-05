@@ -33,6 +33,10 @@ def main():
     ap.add_argument("--repeat", type=int, default=1, help="Measured repetitions on the same frame")
     ap.add_argument("--warmup", type=int, default=1, help="Unmeasured warmup calls")
     ap.add_argument("--record-dir", help="Save effective config, checkpoint hash, frame, candidates, timings")
+    pose_args = ap.add_mutually_exclusive_group()
+    pose_args.add_argument('--camera-pose', help='Capture-time T_base_cam .npy (4x4, metres); overrides NPZ pose')
+    pose_args.add_argument('--assume-home-pose', action='store_true',
+                           help='Explicitly assume this frame was captured at configured home; model FK + hand-eye')
     args = ap.parse_args()
     if args.repeat < 1 or args.warmup < 0:
         ap.error("--repeat >= 1 and --warmup >= 0 required")
@@ -49,15 +53,34 @@ def main():
         with D435.from_config(cfg) as cam:
             rgb, depth_m, K = cam.get_frame()
             geometry = {'rectified': cam.geometry.rectified}
-        if args.save_npz:
-            Path(args.save_npz).parent.mkdir(parents=True, exist_ok=True)
-            save_frame_npz(args.save_npz, rgb, depth_m, K, **geometry)
-            print(f"프레임 저장: {args.save_npz}")
     elif args.npz:
         rgb, depth_m, K, geometry = load_frame_npz(args.npz, cfg, with_metadata=True)
     else:
         ap.error("--npz 또는 --live 중 하나가 필요합니다")
-    cfg['_offline']['frame_geometry'] = geometry
+    from efg.worker_protocol import validate_camera_pose
+    if args.camera_pose:
+        geometry['T_base_cam'] = validate_camera_pose(np.load(args.camera_pose, allow_pickle=False))
+        geometry['camera_pose_source'] = 'explicit_camera_pose_file'
+    elif args.assume_home_pose:
+        from efg.robot_model import XArm7Model
+        from efg.transforms import load_hand_eye
+        joints = np.radians(np.asarray(cfg['robot']['home_joints_deg'], dtype=float))
+        geometry['T_base_cam'] = validate_camera_pose(
+            XArm7Model().flange_pose(joints) @ load_hand_eye(cfg['calib']['hand_eye']))
+        geometry['camera_pose_source'] = 'configured_home_fk_assumption'
+    if cfg['detector']['name'] == 'gfla' and 'T_base_cam' not in geometry:
+        ap.error('GFLA needs T_base_cam in the saved frame or --camera-pose. '
+                 'Only for a known home capture, explicitly use --assume-home-pose.')
+    if args.live and args.save_npz:
+        Path(args.save_npz).parent.mkdir(parents=True, exist_ok=True)
+        save_frame_npz(args.save_npz, rgb, depth_m, K, **geometry)
+        print(f"프레임 저장: {args.save_npz}")
+    cfg['_offline']['frame_geometry'] = {
+        key: value.tolist() if isinstance(value, np.ndarray) else value
+        for key, value in geometry.items()}
+    pose_context = {key: geometry[key] for key in ('T_base_cam', 'camera_pose_source') if key in geometry}
+    if pose_context:
+        print('카메라 자세: ' + geometry['camera_pose_source'])
     print('영상 좌표: ' + ('왜곡 보정 완료 · 저장/보정 K 사용' if geometry['rectified'] else '왜곡 보정 미적용'))
 
     from efg.perception import detect_frame
@@ -70,12 +93,13 @@ def main():
         if args.record_dir:
             write_manifest(cfg, Path(args.record_dir) / "manifest.json", detector=det)
         for _ in range(args.warmup):
-            detect_frame(det, rgb, depth_m, K, cfg, roi)
+            detect_frame(det, rgb, depth_m, K, cfg, roi, **pose_context)
         for index in range(args.repeat):
-            result = detect_frame(det, rgb, depth_m, K, cfg, roi)
+            result = detect_frame(det, rgb, depth_m, K, cfg, roi, **pose_context)
             results.append(result)
             if args.record_dir:
-                save_detection(Path(args.record_dir) / f"frame{index:03d}", rgb, depth_m, K, result, **geometry)
+                save_detection(Path(args.record_dir) / f"frame{index:03d}", rgb, depth_m, K, result,
+                               rectified=geometry['rectified'])
     finally:
         det.close()
     gg, counts = result.grasps, result.counts
@@ -103,7 +127,7 @@ def main():
         from efg.viz import draw_score_grippers
         vis = np.ascontiguousarray(rgb[:, :, ::-1]).copy()
         draw_overlay(vis, roi)
-        draw_score_grippers(vis, gg, K, max_n=int(cfg.get("rerun", {}).get("max_candidates", 25)))
+        draw_score_grippers(vis, gg, K, max_n=int(cfg.get("rerun", {}).get("max_candidates", 50)))
         Path(args.vis).parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(args.vis, vis)
         print(f"오버레이: {args.vis}")

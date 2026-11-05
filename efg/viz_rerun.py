@@ -35,7 +35,7 @@ from .se3 import xarm_pose_to_se3
 from .viz import gripper_segments_3d, score_colors, display_candidate_indices
 
 APP_ID = "exp_foundgrasp"
-MAX_CANDIDATES = 25            # 3D/2D에 그릴 후보 수 (순위 상위)
+MAX_CANDIDATES = 50            # 3D/2D에 그릴 후보 수 (순위 상위, 겹침 허용)
 POINT_STRIDE = 2                # 점군 픽셀 간격
 COL_SELECTED = (65, 215, 255)
 

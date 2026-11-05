@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 
 from ..paths import FOUNDGRASP_ROOT, add_vendor_paths, import_grasp_group
 from .base import GraspDetector
@@ -57,6 +58,7 @@ class FoundGraspDetector(GraspDetector):
         self.refiner = None
         self.refiner_max_w = 0.1  # 독립 detect()의 고정 refiner max_w
         self.last_refiner_ms = None
+        self.last_refiner_width_writebacks = 0
         self._captured = {}
         if rf.get("enabled", True):
             self._load_refiner(rf, device)
@@ -89,11 +91,13 @@ class FoundGraspDetector(GraspDetector):
 
     def detect(self, rgb, depth_m, K):
         self.last_refiner_ms = None
+        self.last_refiner_width_writebacks = 0
         self.impl.last_verifier_ms = None
         if hasattr(self.refiner, "last_stats"):
             self.refiner.last_stats = None
         # Delegate rather than copy: preserve upstream ordering and defaults.
-        # No additional autocast, width adjustment, NMS or candidate truncation.
+        # No additional autocast, opening policy, NMS or candidate truncation;
+        # restore a missing native selected-width writeback below.
         with self.torch.no_grad():
             gg = self.impl.detect(
                 rgb, depth_m, K, top_k=getattr(self, 'top_k', 50),
@@ -101,10 +105,38 @@ class FoundGraspDetector(GraspDetector):
                 use_collision_detection=self.collision,
                 collision_voxel_size=self.collision_voxel,
                 store_vis=False, use_verifier=self.refiner is not None)
+        self.last_refiner_width_writebacks = self._restore_refiner_selected_widths(gg)
         self.last_refiner_ms = self.impl.last_verifier_ms
         stats = getattr(self.refiner, "last_stats", None)
         if stats:
             detail(f"refiner(NMS 전): 입력 {stats['input']} → 측정면 기각 {stats['surface_rejected']}, "
                   f"예산 제외 {stats['budget_skipped']}, 평가 {stats['evaluated']}, "
                   f"평가 후 0점 {stats['zero_after_network']}")
+        if self.last_refiner_width_writebacks:
+            detail(f"refiner 선택 폭 반영: {self.last_refiner_width_writebacks}개 · "
+                   f"검사에 사용한 {self.refiner_max_w * 1000:g}mm 개방 폭 복원")
         return gg
+
+    def _restore_refiner_selected_widths(self, gg):
+        """Write back an opening already selected and scored by the native refiner.
+
+        Native p_free compares its selected opening to the *clamped* input width.
+        If both that opening and depth stay unchanged, it misses the writeback
+        from an oversized raw width to max_w. Narrower choices and depth changes
+        are already written back. NMS depends only on translation/rotation, so
+        restoring this width after native detect preserves its ranking and NMS.
+        Unscored/rejected grasps and all other refiner modes remain untouched.
+        """
+        refiner = self.refiner
+        model = getattr(refiner, 'model', None)
+        if (not getattr(refiner, 'grid', False)
+                or not getattr(model, 'select', None)
+                or getattr(model, 'cfg', {}).get('encoder') not in ('pillar', 'pillar2', 'vfe')
+                or os.environ.get('VERIFIER_NONET', '0') == '1'):
+            return 0
+        widths = gg.grasp_group_array[:, 1]
+        scores = gg.grasp_group_array[:, 0]
+        restore = (np.isfinite(scores) & (scores > 0) & np.isfinite(widths)
+                   & (widths > self.refiner_max_w + 1e-6))
+        widths[restore] = self.refiner_max_w
+        return int(np.count_nonzero(restore))

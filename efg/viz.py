@@ -23,20 +23,12 @@ def score_colors(scores):
     return np.rint(colormaps["RdYlGn"](t)[:, :3] * 255).astype(np.uint8)
 
 
-def display_candidate_indices(gg, max_n=25):
-    """점수가 높은 순서로 12mm 이내 중복 지점을 덜어낸 표시용 인덱스."""
-    selected = []
-    positions = np.asarray(gg.translations)
-    for i in np.argsort(-np.asarray(gg.scores), kind="stable"):
-        if selected and np.any(np.linalg.norm(positions[selected]-positions[i], axis=1) < .012):
-            continue
-        selected.append(int(i))
-        if len(selected) >= max(1, max_n):
-            break
-    return np.asarray(selected, dtype=int)
+def display_candidate_indices(gg, max_n=50):
+    """겹치는 후보도 유지하고 점수순으로 최대 max_n개의 표시 인덱스를 반환."""
+    return np.argsort(-np.asarray(gg.scores), kind="stable")[:max(1, int(max_n))]
 
 
-def draw_score_grippers(bgr, gg, K, max_n=25):
+def draw_score_grippers(bgr, gg, K, max_n=50):
     import cv2
     order = display_candidate_indices(gg, max_n)
     colors = score_colors(np.asarray(gg.scores)[order])

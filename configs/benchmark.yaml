@@ -1,6 +1,7 @@
-# Shared real-robot execution protocol for FoundGrasp / AnyGrasp.
+# Shared execution protocol for FoundGrasp / AnyGrasp / GFLA / RNGNet.
 # Change only detector.name between runs. Motion/calibration come from default.yaml.
-# FoundGrasp keeps its final width; AnyGrasp receives the shared execution margin.
+# FoundGrasp keeps its final width; the baselines receive the shared execution margin.
+# GFLA additionally uses calibrated T_base_cam with table frame = robot base.
 # This is not a byte-for-byte reproduction of the simulator's raw-width protocol.
 base: default.yaml
 detector:

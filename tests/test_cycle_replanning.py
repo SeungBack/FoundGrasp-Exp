@@ -58,7 +58,9 @@ def loop(monkeypatch, tmp_path):
         return (np.full((2, 2, 3), s.frame_id, dtype=np.uint8),
                 np.ones((2, 2), dtype=np.float32), np.eye(3))
 
-    def detect(detector, rgb, *args):
+    def detect(detector, rgb, *args, T_base_cam=None, camera_pose_source=None):
+        np.testing.assert_array_equal(T_base_cam, np.eye(4))
+        assert camera_pose_source == 'measured_robot_and_hand_eye'
         s.detections += 1
         s.events.append(('detect', int(rgb[0, 0, 0])))
         if s.stop_after == s.detections:

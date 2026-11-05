@@ -2,7 +2,7 @@
 
 비교군은 서로 다른 의존성(MinkowskiEngine, pytorch3d, AnyGrasp SDK …)이 필요해
 메인 프로세스에 함께 올릴 수 없다. 논문 시뮬 벤치마크와 같은 방식을 쓴다:
-  워커 = 논문 레포의 ext/<repo>/sim_worker.py (AnyGrasp는 이 레포 workers/anygrasp_worker.py)
+  워커 = workers/의 로컬 어댑터 (이전 비교군은 논문 레포 ext/<repo>/sim_worker.py)
   프로토콜 = efg/worker_protocol.py (기존 파일 규약 + 선택적 시간 메타데이터)
 워커는 build 시 자동으로 띄우고(모델 1회 로드), close/종료 시 내린다.
 
@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from ..paths import import_grasp_group, resolve
-from ..worker_protocol import WorkerClient
+from ..worker_protocol import WorkerClient, validate_camera_pose
 from .base import GraspDetector
 
 READY_MARK = "[worker] serving"
@@ -41,11 +41,12 @@ class WorkerDetector(GraspDetector):
     def __init__(self, cfg, device="cuda", name="worker"):
         super().__init__(cfg, device)
         self.name = name
+        self.requires_camera_pose = name == 'gfla'
         self.last_inference_ms = None
         self.last_roundtrip_ms = None
         self.runtime_metadata = None
-        if name == 'anygrasp' and device != 'cuda':
-            raise ValueError("AnyGrasp worker uses device=cuda; select GPU with CUDA_VISIBLE_DEVICES")
+        if name in ('anygrasp', 'gfla', 'rngnet') and device != 'cuda':
+            raise ValueError(f"{name} worker uses device=cuda; select GPU with CUDA_VISIBLE_DEVICES")
         py = resolve(cfg["python"]) if cfg.get("python") else conda_python(cfg["conda_env"])
         script = resolve(cfg["script"])
         for label, p in (("python", py), ("script", script)):
@@ -101,14 +102,19 @@ class WorkerDetector(GraspDetector):
     def describe(self):
         return f"{self.name} (worker: {Path(self.cfg['script']).name})"
 
-    def detect(self, rgb, depth_m, K):
+    def detect(self, rgb, depth_m, K, *, T_base_cam=None):
         GraspGroup = import_grasp_group()
         if self.proc.poll() is not None:
             raise RuntimeError(f"[{self.name}] 워커 종료됨:\n{self._tail()}")
         self.last_inference_ms = None
         self.last_roundtrip_ms = None
         started = time.perf_counter()
-        arr = self.client.request(rgb, depth_m, K)
+        context = {}
+        if self.requires_camera_pose:
+            if T_base_cam is None:
+                raise ValueError('GFLA requires capture-time T_base_cam (table frame = robot base)')
+            context['T_base_cam'] = validate_camera_pose(T_base_cam)
+        arr = self.client.request(rgb, depth_m, K, **context)
         self.last_roundtrip_ms = (time.perf_counter() - started) * 1000
         if self.client.last_metrics is not None:
             self.last_inference_ms = self.client.last_metrics['inference_ms']

@@ -154,12 +154,13 @@ def test_gripper_measured_finger_length_does_not_double_count_contact_pad(tip_le
     assert min(m.bounds[0, 2] for m in parts.values()) == pytest.approx(-.203)
 
 
-def test_display_spacing_preserves_top_score_and_does_not_mutate_candidates():
+def test_display_keeps_overlapping_candidates_in_score_order_without_mutation():
     from efg.viz import display_candidate_indices
     scores = np.array([.3, .9, .5, .4])
     positions = np.array([[0,0,0], [.001,0,0], [.05,0,0], [.1,0,0]])
     group = SimpleNamespace(scores=scores, translations=positions)
     np.testing.assert_array_equal(display_candidate_indices(group, 2), [1, 2])
+    np.testing.assert_array_equal(display_candidate_indices(group, 4), [1, 2, 3, 0])
     np.testing.assert_array_equal(scores, [.3, .9, .5, .4])
 
 

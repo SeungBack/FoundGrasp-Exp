@@ -145,8 +145,15 @@ def resolve_intrinsics(K_stream, cfg):
     return K
 
 
-def save_frame_npz(path, rgb, depth_m, K, *, rectified=False):
-    np.savez_compressed(path, rgb=rgb, depth_m=depth_m, K=K, rectified=bool(rectified))
+def save_frame_npz(path, rgb, depth_m, K, *, rectified=False, T_base_cam=None,
+                   camera_pose_source=None):
+    from .worker_protocol import validate_camera_pose
+    context = {}
+    if T_base_cam is not None:
+        context['T_base_cam'] = validate_camera_pose(T_base_cam)
+        context['camera_pose_source'] = str(camera_pose_source or 'provided')
+    np.savez_compressed(path, rgb=rgb, depth_m=depth_m, K=K,
+                        rectified=bool(rectified), **context)
 
 
 def load_frame_npz(path, cfg=None, *, with_metadata=False):
@@ -154,12 +161,18 @@ def load_frame_npz(path, cfg=None, *, with_metadata=False):
     with np.load(path, allow_pickle=False) as d:
         frame = d['rgb'], d['depth_m'], d['K']
         rectified = bool(d['rectified'].item()) if 'rectified' in d else False
+        context = {}
+        if 'T_base_cam' in d:
+            from .worker_protocol import validate_camera_pose
+            context['T_base_cam'] = validate_camera_pose(d['T_base_cam'])
+            context['camera_pose_source'] = (str(d['camera_pose_source'].item())
+                                              if 'camera_pose_source' in d else 'recorded')
     if cfg is not None and not rectified:
         from .rgbd_geometry import RGBDCalibration
         geometry = RGBDCalibration(cfg.get('calib', {}))
         frame = geometry.process(*frame)
         rectified = geometry.rectified
-    return (*frame, {'rectified': rectified}) if with_metadata else frame
+    return (*frame, {'rectified': rectified, **context}) if with_metadata else frame
 
 
 class CameraStream(threading.Thread):

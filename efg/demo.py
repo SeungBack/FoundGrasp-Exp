@@ -32,7 +32,7 @@ from .motion_command import PlanRejected
 from .pick_plan import prepare_pick
 from .transfer_plan import prepare_transfer, transfer_waypoint, _require_stopped
 from .payload import load_payload_check
-from .perception import detect_frame
+from .perception import detect_frame, infer_grasps
 from .postprocess import mask_depth_to_roi, uses_standalone_foundgrasp
 from .recording import write_manifest, save_detection
 from .roi import draw_overlay, exclude_near, project_px
@@ -432,6 +432,19 @@ def _home_flange_pose(cfg):
     return XArm7Model().flange_pose(q), q
 
 
+def _warmup_detector(detector, stream, cfg, roi, *, T_base_cam=None):
+    runs = int(get(cfg, 'detector.warmup_runs', 1))
+    needs_pose = getattr(detector, 'requires_camera_pose', False) is True
+    rgb, depth, K = stream.snapshot(fresh=True) if needs_pose else stream.snapshot()
+    if runs > 0:
+        console.row('워밍업', f'{runs}회 · 결과 미사용')
+        if get(cfg, 'postprocess.roi_depth_mask', True):
+            depth = mask_depth_to_roi(depth, roi)
+        for _ in range(runs):
+            infer_grasps(detector, rgb, depth, K, T_base_cam=T_base_cam)
+            stream.raise_if_failed()
+
+
 def run(cfg, auto=True, dry_run=False):
     with console.output_mode(bool(get(cfg, "output.verbose", False))):
         return _run(cfg, auto=auto, dry_run=dry_run)
@@ -454,7 +467,6 @@ def _run(cfg, auto=True, dry_run=False):
 
     T_flange_cam = load_hand_eye(cfg["calib"]["hand_eye"])
     live = bool(get(cfg, "live.enabled", False))
-    mask_roi = bool(get(cfg, "postprocess.roi_depth_mask", True))
     grip_check = bool(get(cfg, "grip_check.enabled", True))
     console.section("FoundGrasp · 실행 준비")
     console.row("설정", cfg["_config_path"])
@@ -517,16 +529,13 @@ def _run(cfg, auto=True, dry_run=False):
             write_manifest(cfg, outdir / 'manifest.json', detector=detector)
         console.row("모델 로그", str(outdir / "model_init.log"))
         viz.log_text(f"방법: {detector.describe()}  설정: {cfg['_config_path']}")
-        warmup_runs = int(get(cfg, "detector.warmup_runs", 1))
-        warm_rgb, warm_depth, warm_K = stream.snapshot()
-        if warmup_runs > 0:
-            console.row("워밍업", f"{warmup_runs}회 · 결과 미사용")
-            if mask_roi:
-                warm_depth = mask_depth_to_roi(warm_depth, roi)
-            for _ in range(warmup_runs):
-                detector.detect(warm_rgb, warm_depth, warm_K)
-                stream.raise_if_failed()
-        del warm_rgb, warm_depth, warm_K
+        needs_pose = getattr(detector, 'requires_camera_pose', False) is True
+        if not needs_pose:
+            _warmup_detector(detector, stream, cfg, roi)
+        elif dry_run:
+            console.row('GFLA 좌표', '작업대=로봇 베이스 · DRY-RUN 홈 자세 가정')
+            warm_flange, _ = _home_flange_pose(cfg)
+            _warmup_detector(detector, stream, cfg, roi, T_base_cam=warm_flange @ T_flange_cam)
         stream.raise_if_failed()
         if not dry_run:
             from .gripper import GripperCtl
@@ -539,6 +548,12 @@ def _run(cfg, auto=True, dry_run=False):
             stream.raise_if_failed()
             if stream.quit_requested or stop.requested:
                 return stats
+            if needs_pose:
+                console.row('GFLA 좌표', '작업대=로봇 베이스 · 실측 홈 자세 + hand-eye')
+                warm_flange, _ = robot.get_flange_pose()
+                _warmup_detector(detector, stream, cfg, roi, T_base_cam=warm_flange @ T_flange_cam)
+                if stream.quit_requested or stop.requested:
+                    return stats
             gripper = GripperCtl(cfg)
             gripper.connect()
             viz.start_robot_stream(robot, gripper=gripper)
@@ -589,10 +604,14 @@ def _run(cfg, auto=True, dry_run=False):
 
             # 입력: ROI 밖 depth 무효화(0) — 전 방법 동일. 전체 프레임 추론 시 후보가
             # ROI 밖(릴리즈 박스 더미)에 몰려 ROI 내 후보가 0개가 되는 것을 방지.
-            # 무효 depth는 센서에서 늘 생기는 정상 입력이라 인공 표면을 만들지 않는다.
+            # 무효 depth의 정규화/점군 변환은 각 어댑터가 처리한다.
+            # 공유 충돌 검사는 ROI 밖 장애물도 포함한 원래 depth를 사용한다.
             cycle_timing.mark("추론·선정·시각화")
             viz.log_stage("Detecting / selecting")
-            detection = detect_frame(detector, rgb, depth_m, K, cfg, roi)
+            detection = detect_frame(
+                detector, rgb, depth_m, K, cfg, roi, T_base_cam=T_base_cam,
+                camera_pose_source=('configured_home_fk_assumption' if dry_run else
+                                    'measured_robot_and_hand_eye'))
             gg_roi, counts = detection.grasps, detection.counts
             detect_ms, post_ms = detection.detect_ms, detection.post_ms
             if save_cycles:
@@ -640,7 +659,7 @@ def _run(cfg, auto=True, dry_run=False):
             if save_cycles:
                 vis = np.ascontiguousarray(rgb[:, :, ::-1]).copy()
                 draw_overlay(vis, roi)
-                draw_score_grippers(vis, gg_roi, K, max_n=int(get(cfg, "rerun.max_candidates", 25)))
+                draw_score_grippers(vis, gg_roi, K, max_n=int(get(cfg, "rerun.max_candidates", 50)))
                 jpg = outdir / f"cycle{n:03d}_grasps.jpg"
                 cv2.imwrite(str(jpg), vis)
 

@@ -1,9 +1,9 @@
 """실행 계층 — 하드웨어 한계와 방법별 출력 계약을 적용.
 
 legacy: FoundGrasp 독립 detect() 출력에는 추가 공유 충돌 검사를 적용하지 않는다.
-common: FoundGrasp / AnyGrasp 모두 동일한 공유 충돌 검사를 적용한다.
-FoundGrasp 출력 폭은 그대로 실행하고 AnyGrasp에는 실행 개방 마진을 곱한다.
-기존 EconomicGrasp/RNGNet/HGGD의 raw-width 계약은 유지한다.
+common: FoundGrasp / AnyGrasp / GFLA / RNGNet에 동일한 공유 충돌 검사를 적용한다.
+FoundGrasp 출력 폭은 그대로 실행하고 비교군에는 실행 개방 마진을 곱한다.
+방법 내부의 폭 보정(GFLA +16mm 등)은 워커 메타데이터에 기록한다.
 
   입력  ROI 밖 depth = 0 (전 방법 동일 입력. 비교군 점군 계열의 workspace crop 과 같은 의미)
   1) 폭 한계 필터   width <= max_open_m (한계 밖 후보는 클립 실행이 아니라 배제)

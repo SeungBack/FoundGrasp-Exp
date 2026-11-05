@@ -3,6 +3,7 @@
   foundgrasp      FoundGrasp-Base + grasp refiner (refiner.enabled=false → detector only)
   economicgrasp   EconomicGrasp (ECCV'24)   — 워커, env efg-economicgrasp
   anygrasp        AnyGrasp SDK              — 워커, env efg-anygrasp
+  gfla            GFLA                     — 워커, env efg-gfla
   rngnet          RNGNet (CoRL'24)          — 워커, env efg-hggd
   hggd            HGGD (RA-L'23)            — 워커, env efg-hggd
 
@@ -17,7 +18,8 @@ import importlib
 
 from .base import GraspDetector  # noqa: F401  (re-export)
 
-WORKER_BACKENDS = ("economicgrasp", "anygrasp", "rngnet", "hggd")
+WORKER_BACKENDS = ("economicgrasp", "anygrasp", "gfla", "rngnet", "hggd")
+COMMON_BACKENDS = ("foundgrasp", "anygrasp", "gfla", "rngnet")
 
 REGISTRY = {
     "foundgrasp": ("efg.detectors.foundgrasp", "FoundGraspDetector"),
@@ -36,11 +38,11 @@ def build_detector(cfg):
     protocol = cfg.get('postprocess', {}).get('protocol', 'legacy')
     if protocol not in ('legacy', 'common'):
         raise ValueError(f"Unknown postprocess.protocol: {protocol}")
-    if protocol == 'common' and name not in ('foundgrasp', 'anygrasp'):
-        raise ValueError("common protocol currently supports foundgrasp / anygrasp only")
     if name not in REGISTRY:
         raise SystemExit(f"알 수 없는 detector.name '{name}' — "
                          f"사용 가능: {', '.join(available())}")
+    if protocol == 'common' and name not in COMMON_BACKENDS:
+        raise ValueError(f"common protocol supports {', '.join(COMMON_BACKENDS)}")
     module, cls_name = REGISTRY[name]
     cls = getattr(importlib.import_module(module), cls_name)
     block = d.get(name)

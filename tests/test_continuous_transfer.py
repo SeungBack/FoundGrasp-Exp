@@ -102,7 +102,10 @@ def test_all_segments_are_queued_before_arrival_polling(scene, monkeypatch, inte
         middle = (plan.pre + plan.upper) / 2
         extra = replace(plan.commands[0], target=tuple(se3_to_xarm_pose(middle)),
                         radius=5., label='상승 중간 경유점')
-        plan = replace(plan, commands=(plan.commands[0], extra, *plan.commands[1:]))
+        commands = (plan.commands[0], extra, *plan.commands[1:])
+        # This fixture creates a different path, so its original-limit snapshot
+        # must contain the extra waypoint too.
+        plan = replace(plan, commands=commands, nominal_commands=commands)
     total = len(plan.commands)
     polls = []
 

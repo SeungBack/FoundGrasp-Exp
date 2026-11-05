@@ -46,6 +46,21 @@ def test_shared_pipeline_uses_masked_input_and_preserves_opening(tmp_path):
     assert np.load(tmp_path / 'frame_raw_grasps.npy').shape == (3, 17)
 
 
+def test_no_roi_retains_full_frame_input_and_candidates_after_shared_filters():
+    """--no-roi must work for nonempty detections, not only empty scenes."""
+    rgb, depth, K, arr = frame()
+    detector = Mock(last_inference_ms=12.5)
+    detector.detect.return_value = import_grasp_group()(arr)
+    cfg = load_config('configs/benchmark.yaml')
+    cfg['postprocess']['collision']['enabled'] = False
+    result = detect_frame(detector, rgb, depth, K, cfg, roi=None)
+    np.testing.assert_array_equal(detector.detect.call_args.args[1], depth)
+    # The over-wide grasp still fails shared filtering; no image ROI clips the
+    # remaining off-image grasp when the user explicitly disables that filter.
+    np.testing.assert_array_equal(result.grasps.grasp_group_array, arr[[0, 2]])
+    assert result.counts['roi'] == result.counts['collision_free'] == 2
+
+
 @pytest.mark.parametrize('invalid', ['nan', 'rotation', 'width'])
 def test_malformed_detector_output_cannot_reach_shared_filters(invalid):
     rgb, depth, K, arr = frame()
@@ -67,13 +82,13 @@ def test_common_execution_enables_collision_for_both_methods(monkeypatch):
     # Reaching backproject proves the legacy FoundGrasp bypass is disabled.
     sentinel = Mock(side_effect=RuntimeError('shared CD reached'))
     monkeypatch.setattr(postprocess, 'backproject', sentinel)
-    for name in ['foundgrasp', 'anygrasp']:
+    for name in ['foundgrasp', 'anygrasp', 'gfla', 'rngnet']:
         cfg['detector']['name'] = name
         with pytest.raises(RuntimeError, match='shared CD reached'):
             postprocess.shared_filter(import_grasp_group()(arr.copy()), depth, K, cfg)
         assert postprocess.open_width_m(.06, cfg) == pytest.approx(
             .06 if name == 'foundgrasp' else .072)
-    assert sentinel.call_count == 2
+    assert sentinel.call_count == 4
 
 
 def test_manifest_records_effective_settings_and_content_hash(tmp_path):

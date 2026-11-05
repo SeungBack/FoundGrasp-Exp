@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from efg.detectors.foundgrasp import FoundGraspDetector
-from efg.paths import import_grasp_group
+from efg.paths import FOUNDGRASP_ROOT, add_vendor_paths, import_grasp_group
 from efg import postprocess
 
 
@@ -53,3 +53,95 @@ def test_standalone_skips_extra_collision_and_extra_width_margin(monkeypatch):
     assert postprocess.open_width_m(.06, cfg) == pytest.approx(.06)
     cfg["detector"]["name"] = "economicgrasp"
     assert postprocess.open_width_m(.06, cfg) == pytest.approx(.072)
+
+
+@pytest.mark.parametrize("selected_depth, writebacks", [(.02, 1), (.025, 0)])
+def test_native_selected_width_is_restored_without_changing_score_or_depth(
+        monkeypatch, selected_depth, writebacks):
+    """Exercise real p_free's writeback branch with a known network verdict."""
+    import torch
+
+    add_vendor_paths(FOUNDGRASP_ROOT, FOUNDGRASP_ROOT / 'scripts')
+    from verifier_points import Verifier
+
+    monkeypatch.delenv('VERIFIER_NONET', raising=False)
+    monkeypatch.setenv('VERIFIER_BUDGET', '0')
+    # The refiner branch runs entirely on CPU; only the learned verdict is fixed.
+    monkeypatch.setattr(torch, 'autocast', lambda *args, **kwargs: nullcontext())
+    native = Verifier.__new__(Verifier)
+    native.grid = True
+    native.features = []
+    native.ax = native.P = None
+    native.flag = 0
+    native.compiled = False
+    native.G = SimpleNamespace(fc_score=lambda q, kind: q[:, 0])
+    native.model = SimpleNamespace(
+        cfg={'encoder': 'pillar', 'mu': [.1], 'fc_target': 'cls'},
+        surf_tau=0., select=([0.], None), fold=lambda maps: None)
+    native.fast = lambda gi, *args, **kwargs: (
+        torch.zeros(len(gi)), torch.ones(len(gi), 1), None,
+        torch.tensor([[.1, selected_depth]]).repeat(len(gi), 1))
+    xyz = torch.tensor([[[0., .1], [0., .1]], [[0., 0.], [.1, .1]],
+                        [[.5, .5], [.5, .5]]])
+    rows = np.zeros((1, 17), dtype=np.float32)
+    rows[0, :4] = [.7, .12, .02, .02]
+    rows[0, 4:13] = np.eye(3).flatten()
+    rows[0, 15] = .5
+    gg = import_grasp_group()(rows)
+    tensor = torch.from_numpy(gg.grasp_group_array)
+    verdict = native.p_free(tensor, xyz, {}, max_w=.1)
+    gg.grasp_group_array[:, 0] *= verdict.numpy()
+    # Upstream misses width writeback precisely when depth stays unchanged.
+    assert gg.widths[0] == pytest.approx(.12 if writebacks else .1)
+    scored = gg.grasp_group_array.copy()
+
+    detector = FoundGraspDetector.__new__(FoundGraspDetector)
+    detector.torch = SimpleNamespace(no_grad=nullcontext)
+    detector.refiner = native
+    detector.refiner_max_w = .1
+    detector.collision = True
+    detector.collision_voxel = .01
+    detector.impl = SimpleNamespace(last_verifier_ms=None, detect=Mock(return_value=gg))
+    result = detector.detect('rgb', 'depth', 'K')
+    assert result.widths[0] == pytest.approx(.1)
+    assert result.depths[0] == pytest.approx(selected_depth)
+    assert detector.last_refiner_width_writebacks == writebacks
+    np.testing.assert_array_equal(result.grasp_group_array[:, 0], scored[:, 0])
+    np.testing.assert_array_equal(result.grasp_group_array[:, 2:], scored[:, 2:])
+
+
+def test_width_writeback_does_not_retain_rejections_or_hide_invalid_geometry(monkeypatch):
+    monkeypatch.delenv('VERIFIER_NONET', raising=False)
+    detector = FoundGraspDetector.__new__(FoundGraspDetector)
+    detector.refiner = SimpleNamespace(
+        grid=True, model=SimpleNamespace(cfg={'encoder': 'pillar'}, select=([0.], None)))
+    detector.refiner_max_w = .1
+    rows = np.zeros((9, 17))
+    rows[:, 0] = [1., 0., -1., np.nan, np.inf, 1., 1., 1., 1.]
+    # A selected float32 100mm width copied into float64 is not a missed writeback.
+    rows[:, 1] = [.12, .12, .12, .12, .12, .06, np.inf, np.nan, float(np.float32(.1))]
+    expected = rows.copy()
+    expected[0, 1] = .1
+    gg = import_grasp_group()(rows)
+    assert detector._restore_refiner_selected_widths(gg) == 1
+    np.testing.assert_array_equal(gg.grasp_group_array, expected)
+
+
+@pytest.mark.parametrize('grid, select, encoder, nonet', [
+    (False, ([0.], None), 'pillar', '0'),
+    (True, None, 'pillar', '0'),
+    (True, ([0.], None), 'other', '0'),
+    (True, ([0.], None), 'pillar', '1'),
+])
+def test_width_writeback_skips_modes_without_configuration_selection(
+        monkeypatch, grid, select, encoder, nonet):
+    monkeypatch.setenv('VERIFIER_NONET', nonet)
+    detector = FoundGraspDetector.__new__(FoundGraspDetector)
+    detector.refiner = SimpleNamespace(
+        grid=grid, model=SimpleNamespace(cfg={'encoder': encoder}, select=select))
+    detector.refiner_max_w = .1
+    rows = np.zeros((1, 17))
+    rows[0, :2] = [.7, .12]
+    gg = import_grasp_group()(rows)
+    assert detector._restore_refiner_selected_widths(gg) == 0
+    np.testing.assert_array_equal(gg.grasp_group_array, rows)

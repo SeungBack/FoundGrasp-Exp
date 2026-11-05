@@ -6,6 +6,7 @@ import numpy as np
 
 from .postprocess import mask_depth_to_roi, shared_filter
 from .roi import filter_roi
+from .worker_protocol import validate_camera_pose
 
 
 @dataclass
@@ -16,6 +17,8 @@ class DetectionFrame:
     post_ms: float
     inference_ms: float | None
     raw_grasps: np.ndarray | None = None
+    T_base_cam: np.ndarray | None = None
+    camera_pose_source: str | None = None
 
 
 def validate_frame(rgb, depth_m, K):
@@ -28,13 +31,24 @@ def validate_frame(rgb, depth_m, K):
         raise ValueError("Depth must contain finite metres; invalid pixels must be zero")
 
 
-def detect_frame(detector, rgb, depth_m, K, cfg, roi=None):
+def infer_grasps(detector, rgb, depth_m, K, *, T_base_cam=None):
+    """Forward calibrated pose only to methods whose input contract needs it."""
+    if getattr(detector, 'requires_camera_pose', False) is True:
+        if T_base_cam is None:
+            raise ValueError('GFLA requires capture-time T_base_cam (table frame = robot base)')
+        return detector.detect(rgb, depth_m, K, T_base_cam=validate_camera_pose(T_base_cam))
+    return detector.detect(rgb, depth_m, K)
+
+
+def detect_frame(detector, rgb, depth_m, K, cfg, roi=None, *, T_base_cam=None,
+                 camera_pose_source=None):
     """Inference timing excludes shared postprocessing; worker IPC is explicit."""
     validate_frame(rgb, depth_m, K)
+    camera_pose = None if T_base_cam is None else validate_camera_pose(T_base_cam)
     depth_in = (mask_depth_to_roi(depth_m, roi)
                 if cfg['postprocess'].get('roi_depth_mask', True) else depth_m)
     started = time.perf_counter()
-    gg = detector.detect(rgb, depth_in, K)
+    gg = infer_grasps(detector, rgb, depth_in, K, T_base_cam=camera_pose)
     detect_ms = (time.perf_counter() - started) * 1000
     post_started = time.perf_counter()
     arr = gg.grasp_group_array
@@ -52,4 +66,5 @@ def detect_frame(detector, rgb, depth_m, K, cfg, roi=None):
     gg = filter_roi(gg, K, roi)
     counts['roi'] = len(gg)
     return DetectionFrame(gg, counts, detect_ms, (time.perf_counter() - post_started) * 1000,
-                          getattr(detector, 'last_inference_ms', None), raw)
+                          getattr(detector, 'last_inference_ms', None), raw,
+                          camera_pose, camera_pose_source)

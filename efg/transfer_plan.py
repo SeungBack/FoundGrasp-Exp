@@ -4,6 +4,8 @@ IK sampling is a feasibility screen, not certification of the controller path.
 A prepared plan is tied to the measured robot state and never changed in flight.
 """
 from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from numbers import Real
 import re
 
 import numpy as np
@@ -360,8 +362,9 @@ def transfer_route_candidates(current, T_pre, T_lift, robot_cfg, drop_cfg, R_hom
     pre-grasp + 50mm remain hard lower bounds. At each height try the configured
     orientation, half tilt correction, then nearest upright. Legacy dual-sign
     search uses the two configured signs and nearest upright instead, retaining
-    three routes per height. Rotation alternatives retain a short vertical guard
-    so rounded rotation cannot start below pre.
+    three routes per height. Optional bounded upright yaw offsets are appended
+    after all of those routes. Rotation alternatives retain a short vertical
+    guard so rounded rotation cannot start below pre.
     """
     signs = transfer_signs(drop_cfg, transfer_sign, allow_symmetry=allow_symmetry)
     routes = []
@@ -377,6 +380,39 @@ def transfer_route_candidates(current, T_pre, T_lift, robot_cfg, drop_cfg, R_hom
                 return
         routes.append(route)
 
+    def append_rotation(upper, radius, rotation, name, *, rotation_floor_z=None):
+        # All orientation alternatives share the same escape and guard geometry.
+        # Changing the heading must not rotate the gripper below pre-grasp.
+        guard = T_pre.copy()
+        guard[2, 3] += .2 * (upper[2, 3] - T_pre[2, 3])
+        if rotation_floor_z is not None:
+            guard[2, 3] = max(guard[2, 3],
+                              rotation_floor_z + .5 * (upper[2, 3] - rotation_floor_z))
+        target = upper.copy()
+        target[:3, :3] = rotation
+        incoming_radius = min(radius, (target[2, 3] - guard[2, 3]) * 250)
+        retreat, rise, transfer = transfer_commands(
+            current, T_pre, target, incoming_radius, robot_cfg, drop_cfg)
+        retreat = replace(retreat, radius=(
+            min(retreat.radius, (guard[2, 3] - T_pre[2, 3]) * 250)
+            if retreat.radius > 0 else retreat.radius))
+        guard_radius = min(float(robot_cfg.get('retreat_blend_radius_mm', 5)),
+                           (guard[2, 3] - T_pre[2, 3]) * 250,
+                           (target[2, 3] - guard[2, 3]) * 250)
+        if rotation_floor_z is not None:
+            # Even the incoming rounded corner must stay above the explicit
+            # lateral-clearance floor before yawing a held object.
+            guard_radius = min(guard_radius, (guard[2, 3] - rotation_floor_z) * 250)
+        guard_speed, _ = reorientation_speed(T_pre, guard, robot_cfg)
+        rise_speed, _ = reorientation_speed(guard, target, robot_cfg)
+        guard_command = MotionCommand(
+            'cartesian', tuple(se3_to_xarm_pose(guard)), guard_speed,
+            float(robot_cfg.get('reorient_acc_mm_s2', 150)),
+            guard_radius if guard_radius > .01 else -1, '자세 유지 상승')
+        append(TransferRoute(name, T_pre, target, 1,
+                             (retreat, guard_command, replace(rise, speed=rise_speed), transfer),
+                             current))
+
     if preferred_route is not None:
         if not isinstance(preferred_route, TransferRoute):
             raise TypeError('preferred_route는 TransferRoute여야 합니다')
@@ -386,7 +422,11 @@ def transfer_route_candidates(current, T_pre, T_lift, robot_cfg, drop_cfg, R_hom
             raise RuntimeError('파지 방향 유지 모드의 복귀 경로에 180° 대칭을 사용할 수 없습니다')
         append(replace(preferred_route, start=current))
     search = bool(drop_cfg.get('route_search', False))
+    yaw_offsets = _upright_yaw_offsets(drop_cfg) if search else ()
     minimum = _minimum_transfer_height(drop_cfg)
+    if yaw_offsets and minimum is None:
+        raise ValueError('upright_yaw_offsets_deg 탐색에는 명시적인 '
+                         'drop.min_transfer_height_m가 필요합니다')
     step = float(drop_cfg.get('height_search_step_m', .02))
     if not np.isfinite(step) or step <= 0:
         raise ValueError('drop.height_search_step_m는 유한한 양수여야 합니다')
@@ -422,31 +462,45 @@ def transfer_route_candidates(current, T_pre, T_lift, robot_cfg, drop_cfg, R_hom
         if not search or not has_tilt:
             continue
         upper, radius = transfer_waypoint(T_pre, T_lift, height_cfg, R_home_tcp, transfer_sign)
-        guard = T_pre.copy()
-        guard[2, 3] += .2 * (upper[2, 3] - T_pre[2, 3])
         corrections = ((1., 'upright'),) if len(signs) > 1 else ((.5, 'half_tilt'), (1., 'upright'))
         for fraction, name in corrections:
-            target = upper.copy()
-            target[:3, :3] = rotations(fraction).as_matrix()
-            incoming_radius = min(radius, (target[2, 3] - guard[2, 3]) * 250)
-            retreat, rise, transfer = transfer_commands(
-                current, T_pre, target, incoming_radius, robot_cfg, drop_cfg)
-            retreat = replace(retreat, radius=(
-                min(retreat.radius, (guard[2, 3] - T_pre[2, 3]) * 250)
-                if retreat.radius > 0 else retreat.radius))
-            guard_radius = min(float(robot_cfg.get('retreat_blend_radius_mm', 5)),
-                               (guard[2, 3] - T_pre[2, 3]) * 250,
-                               (target[2, 3] - guard[2, 3]) * 250)
-            guard_speed, _ = reorientation_speed(T_pre, guard, robot_cfg)
-            rise_speed, _ = reorientation_speed(guard, target, robot_cfg)
-            guard_command = MotionCommand(
-                'cartesian', tuple(se3_to_xarm_pose(guard)), guard_speed,
-                float(robot_cfg.get('reorient_acc_mm_s2', 150)),
-                guard_radius if guard_radius > .01 else -1, '자세 유지 상승')
-            append(TransferRoute(prefix + name, T_pre, target, 1,
-                                 (retreat, guard_command, replace(rise, speed=rise_speed), transfer),
-                                 current))
+            append_rotation(upper, radius, rotations(fraction).as_matrix(), prefix + name)
+    # Exhaust the established height/tilt family before changing the heading.
+    # These are small tool-z rotations about upright, never jaw-symmetry flips.
+    if yaw_offsets:
+        for height_name, height in heights:
+            height_cfg = dict(drop_cfg, via_height_m=height)
+            prefix = '' if height_name == 'nominal' else height_name + '_'
+            upper, radius = transfer_waypoint(T_pre, T_lift, height_cfg, R_home_tcp, transfer_sign)
+            for degrees in yaw_offsets:
+                rotation = upright @ Rotation.from_euler('z', degrees, degrees=True).as_matrix()
+                suffix = ('p' if degrees > 0 else 'm') + f'{abs(degrees):g}'
+                append_rotation(upper, radius, rotation, prefix + 'upright_yaw_' + suffix,
+                                rotation_floor_z=minimum)
     return routes
+
+
+def _upright_yaw_offsets(drop_cfg):
+    """Read a bounded optional heading search; disabled by an empty iterable."""
+    raw = drop_cfg.get('upright_yaw_offsets_deg', ())
+    message = ('drop.upright_yaw_offsets_deg는 중복 없는 숫자 최대 8개여야 하며, '
+               '각 값은 0 < 절댓값 <= 45도여야 합니다')
+    if isinstance(raw, (str, bytes, Mapping)):
+        raise ValueError(message)
+    try:
+        entries = iter(raw)
+    except TypeError as exc:
+        raise ValueError(message) from exc
+    offsets = []
+    for entry in entries:
+        if (len(offsets) >= 8 or isinstance(entry, bool) or not isinstance(entry, Real)
+                or not 0 < abs(entry) <= 45 or not np.isfinite(entry)):
+            raise ValueError(message)
+        value = float(entry)
+        if value in offsets:
+            raise ValueError(message)
+        offsets.append(value)
+    return tuple(offsets)
 
 
 def _minimum_transfer_height(drop_cfg):
