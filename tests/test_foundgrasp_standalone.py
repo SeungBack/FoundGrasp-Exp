@@ -127,6 +127,43 @@ def test_width_writeback_does_not_retain_rejections_or_hide_invalid_geometry(mon
     np.testing.assert_array_equal(gg.grasp_group_array, expected)
 
 
+@pytest.mark.parametrize('raw_widths, writebacks', [([.12, .06], 1), ([.09, .06], 0), ([], 0)])
+def test_detect_handles_readonly_nms_output_without_mutating_native_storage(
+        monkeypatch, raw_widths, writebacks):
+    """Small NMS results bypass top-k copying and may still own C++ readonly memory."""
+    monkeypatch.delenv('VERIFIER_NONET', raising=False)
+    rows = np.zeros((len(raw_widths), 17))
+    rows[:, 0] = np.linspace(.8, .7, len(rows))
+    rows[:, 1] = raw_widths
+    rows[:, 2:4] = .02
+    rows[:, 4:13] = np.eye(3).reshape(9)
+    rows[:, 13] = np.arange(len(rows)) * .2
+    rows[:, 15] = .5
+    native = import_grasp_group()(rows)
+    if len(native):
+        native = native.nms()
+    source = native.grasp_group_array
+    source.setflags(write=False)  # Keep the regression valid with other SDK builds too.
+    before = source.copy()
+
+    detector = FoundGraspDetector.__new__(FoundGraspDetector)
+    detector.torch = SimpleNamespace(no_grad=nullcontext)
+    detector.refiner = SimpleNamespace(
+        grid=True, model=SimpleNamespace(cfg={'encoder': 'pillar'}, select=([0.], None)))
+    detector.refiner_max_w = .1
+    detector.collision = True
+    detector.collision_voxel = .01
+    detector.impl = SimpleNamespace(last_verifier_ms=None, detect=Mock(return_value=native))
+    result = detector.detect('rgb', 'depth', 'K')
+
+    expected = before.copy()
+    expected[expected[:, 1] > .1, 1] = .1
+    np.testing.assert_array_equal(result.grasp_group_array, expected)
+    np.testing.assert_array_equal(source, before)
+    assert not source.flags.writeable
+    assert detector.last_refiner_width_writebacks == writebacks
+
+
 @pytest.mark.parametrize('grid, select, encoder, nonet', [
     (False, ([0.], None), 'pillar', '0'),
     (True, None, 'pillar', '0'),

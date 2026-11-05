@@ -138,5 +138,13 @@ class FoundGraspDetector(GraspDetector):
         scores = gg.grasp_group_array[:, 0]
         restore = (np.isfinite(scores) & (scores > 0) & np.isfinite(widths)
                    & (widths > self.refiner_max_w + 1e-6))
-        widths[restore] = self.refiner_max_w
-        return int(np.count_nonzero(restore))
+        count = int(np.count_nonzero(restore))
+        if not count:
+            return 0
+        # Native NMS can return a read-only C++ buffer, especially when top-k
+        # slicing does not make a copy. Own the modified data; never unlock or
+        # write into the native buffer (even an empty assignment can fail).
+        updated = gg.grasp_group_array.copy()
+        updated[restore, 1] = self.refiner_max_w
+        gg.grasp_group_array = updated
+        return count
